@@ -41,8 +41,8 @@ There isn't, because relations were never indexed as searchable terms. Fibery
 makes you leave search and build a view.
 
 There is also a haystack problem underneath all of it. Of 3.17M rows in this
-workspace, 2.08M are `Collaboration~Documents/Document` — and only 453k of
-those hold any content at all. A further 284k domain rows have no title and no
+workspace, 2.08M are `Collaboration~Documents/Document`, of which only 453k carry a
+content handle and only **124k hold any prose at all**. A further 284k domain rows have no title and no
 prose (HubSpot emails with a null subject, empty join rows, placeholder
 records). **Roughly 88% of the rows are not things anyone would want to find.**
 
@@ -73,7 +73,7 @@ entities.
 | "`RVO #Bet`… update filtering as I type" | `rvo #bet` | 58 Bets (from 2,569 bare `rvo`) | 0.06 ms |
 | …as-you-type prefix | `interv*` | 3,429 | 0.91 ms |
 | "all Notes related to the Platform team that contain *Interventions*" | `#note related:(#team platform) interventions` | 21 | 0.28 ms |
-| "what has my teammate worked on or commented on recently" | `touched-by:@michael updated:-30d sort:recent` | 2,184 across 67 dbs | 0.58 ms |
+| "what has my teammate worked on or commented on recently" | `touched-by:@michael updated:-30d sort:recent` | 2,184 across 54 dbs | 0.58 ms |
 | …just their comments | `commented-by:@michael updated:-90d` | 507 | 0.29 ms |
 | "locating your current document is basically impossible" | `vibery locate "Keycloak / SCIM Uplift"` | parents, teams, backlinks | 1 ms |
 | Search is slow | `"point cloud"` (phrase, 9,374 hits) | worst real query | 1.22 ms |
@@ -134,14 +134,19 @@ across the schema — assignee, reviewer, tech lead, security owner, last
 reviewed by. Rather than enumerating roles, ingest treats all of them uniformly:
 each writes `<role>:<uuid>` *and* a role-agnostic `touched:<uuid>`. That single
 decision is what makes "what has my teammate been working on" a one-term query
-across all 211 databases instead of a view someone has to build.
+across all 211 searchable databases instead of a view someone has to build.
 
 **Relations are terms on both sides, so traversal is a subquery.**
 `related:(#team platform)` runs the inner query, collects up to 4,096 anchor
 ids, and rewrites itself as a disjunction over `rel`. One extra index pass per
 hop, and hops nest. Doc mentions (`Collaboration~Documents/Reference`) are
 folded in as symmetric edges too, so "related to" covers *mentioned alongside*
-and not just *typed relation field*.
+and not just *typed relation field*. When the relation is **named**, the
+catalog constrains the subquery to the types that field can actually point at —
+`team:(platform)` becomes "linked via a team-ish field to a `Company/Team`
+matching platform", which cut that query from 4,096 anchors and 33 ms to 5
+anchors and 3 ms for identical results. If the anchor cap is ever hit the
+result line says so explicitly, rather than silently returning a wrong answer.
 
 Smaller things that turned out to matter:
 
@@ -155,8 +160,8 @@ Smaller things that turned out to matter:
   result set tells you what to type next (`in: #Note 1519 · #Task 208 · …`),
   which is what makes narrowing a keyboard move rather than a mouse hunt.
 - **`is:open` reads the schema's own `workflow/Final` flag**, not a list of
-  state names. 347 workflow tables each name their states differently; the flag
-  is authoritative. It partitions exactly: 612 open + 7,713 closed = 8,325 issues.
+  state names. The 61 workflow tables define 311 states between them, each
+  naming them differently; the flag is authoritative. It partitions exactly: 612 open + 7,713 closed = 8,325 issues.
 - **Ranking** is BM-25 with a title boost (6×) over body (1×) over comments
   (0.4×), nudged by `log(inbound_references)` so a widely-cited note beats an
   incidental mention.

@@ -332,7 +332,40 @@ impl Engine {
             }
 
             Node::Related { field, sub } => {
-                let inner = self.compile(sub, notes)?;
+                // A *named* relation can only point at certain types, and the
+                // catalog knows which. Constraining the subquery to those types
+                // makes `team:(platform)` mean "linked via a team-ish field to a
+                // Team matching platform" instead of "to anything, anywhere":
+                // far more precise, and it keeps the anchor set small.
+                let mut inner = self.compile(sub, notes)?;
+                if let Some(fname) = field {
+                    let aliases = role_aliases(fname);
+                    let mut targets: Vec<&str> = self
+                        .catalog
+                        .searchable()
+                        .flat_map(|d| d.fields.iter())
+                        .filter(|fd| {
+                            fd.kind == crate::catalog::FieldKind::Relation
+                                && aliases.contains(&crate::ingest::field_key(&fd.name))
+                        })
+                        .map(|fd| fd.target.as_str())
+                        .collect();
+                    targets.sort_unstable();
+                    targets.dedup();
+                    if !targets.is_empty() {
+                        notes.push(format!(
+                            "{fname}:(...) targets {}",
+                            targets.join(", ")
+                        ));
+                        let type_filter = self.any_of(
+                            targets.iter().map(|t| self.term(f.db, t)).collect(),
+                        );
+                        inner = Box::new(BooleanQuery::new(vec![
+                            (Occur::Must, inner),
+                            (Occur::Must, type_filter),
+                        ]));
+                    }
+                }
                 let searcher = self.reader.searcher();
                 let top = searcher.search(&inner, &TopDocs::with_limit(REL_SUBQUERY_CAP))?;
                 let mut ids: Vec<String> = Vec::with_capacity(top.len());
@@ -343,9 +376,15 @@ impl Engine {
                     }
                 }
                 notes.push(format!(
-                    "related:(...) -> {} anchor entit{}",
+                    "related:(...) -> {} anchor entit{}{}",
                     ids.len(),
-                    if ids.len() == 1 { "y" } else { "ies" }
+                    if ids.len() == 1 { "y" } else { "ies" },
+                    // Silent truncation would quietly give wrong answers.
+                    if ids.len() >= REL_SUBQUERY_CAP {
+                        " (CAPPED — results incomplete, narrow the subquery)"
+                    } else {
+                        ""
+                    }
                 ));
                 if ids.is_empty() {
                     return Ok(Box::new(EmptyQuery));
