@@ -90,8 +90,11 @@ enum Cmd {
 
     /// "Where does this thing live, and what points at it?"
     Locate {
-        /// Entity UUID or public id.
+        /// Entity UUID, public id, or a title to search for.
         target: String,
+        /// Disambiguate a public id or title by database, e.g. `--db note`.
+        #[arg(long)]
+        db: Option<String>,
     },
 
     /// Show the parsed AST and compiled query without running it.
@@ -191,7 +194,7 @@ fn real_main() -> Result<()> {
             by_role,
         } => activity(&cli.index, who, *days, *limit, *by_role),
 
-        Cmd::Locate { target } => locate(&cli.index, target),
+        Cmd::Locate { target, db } => locate(&cli.index, target, db.as_deref()),
 
         Cmd::Explain { query } => {
             let eng = Engine::open(&cli.index)?;
@@ -417,20 +420,19 @@ fn activity(index: &std::path::Path, who: &str, days: i64, limit: usize, by_role
         user.name, user.email
     );
 
+    // The user directory is excluded: being named in someone's `Reporters` or
+    // `Manager` field is not "work they did", and those rows all move together
+    // whenever the directory syncs.
+    let u = format_uuid(uid);
+    let common = format!("-db:fibery/user updated:-{days}d sort:recent limit:{limit}");
     let roles: Vec<(&str, String)> = if by_role {
         vec![
-            ("created", format!("by:@{} updated:-{days}d sort:recent limit:{limit}", format_uuid(uid))),
-            ("commented", format!("commented-by:@{} updated:-{days}d sort:recent limit:{limit}", format_uuid(uid))),
-            ("assigned", format!("assignees:@{} updated:-{days}d sort:recent limit:{limit}", format_uuid(uid))),
+            ("created", format!("by:@{u} {common}")),
+            ("commented", format!("commented-by:@{u} {common}")),
+            ("assigned", format!("assignees:@{u} {common}")),
         ]
     } else {
-        vec![(
-            "touched",
-            format!(
-                "touched-by:@{} updated:-{days}d sort:recent limit:{limit}",
-                format_uuid(uid)
-            ),
-        )]
+        vec![("touched", format!("touched-by:@{u} {common}"))]
     };
 
     let now = now_secs();
@@ -470,20 +472,49 @@ fn activity(index: &std::path::Path, who: &str, days: i64, limit: usize, by_role
 // ---------------------------------------------------------------- locate
 
 /// "Where am I?" — the context an entity sits in, plus what points at it.
-fn locate(index: &std::path::Path, target: &str) -> Result<()> {
+fn locate(index: &std::path::Path, target: &str, db: Option<&str>) -> Result<()> {
     let eng = Engine::open(index)?;
 
-    // Accept a UUID, or a public id resolved through the index.
     let id = match parse_uuid(target) {
         Some(v) => v,
         None => {
-            let (spec, warns) = Parser::parse(&format!("pid:{target}"));
-            let res = eng.search(&Spec { limit: 1, ..spec }, warns)?;
-            let hit = res
-                .hits
-                .first()
-                .with_context(|| format!("nothing found for `{target}`"))?;
-            parse_uuid(&hit.id).context("bad id in index")?
+            // A public id is only unique *within* a database in Fibery, so this
+            // can legitimately match several entities. Fall back to a title
+            // search when it looks like text rather than a number.
+            // Quote it: database names contain spaces (`Exchange Rate`), and an
+            // unquoted `#exchange rate` would lex `rate` as a free-text word.
+            let dbq = db.map(|d| format!(" #\"{d}\"")).unwrap_or_default();
+            let q = if target.chars().all(|c| c.is_ascii_digit()) {
+                format!("pid:{target}{dbq}")
+            } else {
+                format!("title:\"{target}\"{dbq}")
+            };
+            let (spec, warns) = Parser::parse(&q);
+            let res = eng.search(&Spec { limit: 10, ..spec }, warns)?;
+            match res.hits.len() {
+                0 => anyhow::bail!(
+                    "nothing found for `{target}`{}",
+                    db.map(|d| format!(" in #{d}")).unwrap_or_default()
+                ),
+                1 => parse_uuid(&res.hits[0].id).context("bad id in index")?,
+                _ => {
+                    println!();
+                    println!(
+                        "`{target}` matches {} entities — narrow it with --db, or pass a uuid:",
+                        res.total
+                    );
+                    for h in &res.hits {
+                        println!(
+                            "  \x1b[33m{:<44}\x1b[0m {}  \x1b[2m{}\x1b[0m",
+                            h.db,
+                            truncate(if h.title.is_empty() { "(untitled)" } else { &h.title }, 50),
+                            h.id
+                        );
+                    }
+                    println!();
+                    return Ok(());
+                }
+            }
         }
     };
 
@@ -590,35 +621,48 @@ fn bench(index: &std::path::Path, iters: usize) -> Result<()> {
     ];
 
     println!();
-    println!("{:<52} {:>9} {:>10} {:>10}", "query", "matches", "median", "best");
-    println!("{}", "─".repeat(85));
+    println!(
+        "{:<50} {:>9} {:>9} {:>9}",
+        "query", "matches", "count", "full"
+    );
+    println!("{}", "─".repeat(80));
+
+    let median = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
+        v[v.len() / 2]
+    };
 
     for (label, q) in cases {
         let (spec, _) = Parser::parse(q);
-        let mut times = Vec::with_capacity(iters);
+        // Two measurements: matching alone, and the whole user-visible path
+        // (match + rank + fetch + decode the top 20 stored documents).
+        let full_spec = Spec { limit: 20, ..spec.clone() };
+        let mut count_ms = Vec::with_capacity(iters);
+        let mut full_ms = Vec::with_capacity(iters);
         let mut total = 0usize;
         for _ in 0..iters {
             let (n, ms) = eng.count(&spec)?;
             total = n;
-            times.push(ms);
+            count_ms.push(ms);
+            let t = std::time::Instant::now();
+            let _ = eng.search(&full_spec, Vec::new())?;
+            full_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         }
-        times.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
-        let median = times[times.len() / 2];
-        let best = times[0];
         println!(
-            "{:<52} {:>9} {:>8.2}ms {:>8.2}ms",
-            truncate(label, 52),
+            "{:<50} {:>9} {:>7.2}ms {:>7.2}ms",
+            truncate(label, 50),
             total,
-            median,
-            best
+            median(count_ms),
+            median(full_ms)
         );
         if !q.is_empty() {
             println!("  \x1b[2m{q}\x1b[0m");
         }
     }
     println!();
-    println!("\x1b[2mTimes are match-counting only (no document retrieval),");
-    println!("median of {iters} runs, single-threaded, warm page cache.\x1b[0m");
+    println!("\x1b[2mcount = matching only.  full = match + rank + fetch top 20 stored docs,");
+    println!("i.e. everything behind one keystroke. Median of {iters} runs, single");
+    println!("thread, warm page cache.\x1b[0m");
     println!();
     Ok(())
 }

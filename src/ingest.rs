@@ -27,6 +27,12 @@ struct Sidecars {
     comments: FxHashMap<u128, (Option<u128>, Option<u128>)>,
     /// enum value id -> label
     enums: FxHashMap<u128, Box<str>>,
+    /// workflow state id -> (is_final, lifecycle type: started / finished / …)
+    ///
+    /// The schema marks terminal states explicitly via `workflow/Final`, which
+    /// is far better than guessing from state names: every one of the 347
+    /// workflow tables names its states differently.
+    states: FxHashMap<u128, (bool, Box<str>)>,
     /// entity id -> number of inbound document references
     inbound: FxHashMap<u128, u32>,
     /// entity id -> entities it is linked to by a document mention, both ways
@@ -137,7 +143,8 @@ impl Sidecars {
             .iter()
             .filter(|d| d.is_enum && d.file.is_some())
             .collect();
-        let enums: FxHashMap<u128, Box<str>> = enum_dbs
+        type EnumRow = (u128, Box<str>, Option<(bool, Box<str>)>);
+        let rows: Vec<EnumRow> = enum_dbs
             .par_iter()
             .flat_map(|d| {
                 let title = d.title_field.clone().unwrap_or_else(|| "enum/name".into());
@@ -149,15 +156,34 @@ impl Sidecars {
                     if label.is_empty() {
                         return None;
                     }
-                    Some((id, label.to_string().into_boxed_str()))
+                    // Only workflow-state tables carry `workflow/Final`.
+                    let wf = v.get("workflow/Final").and_then(|b| b.as_bool()).map(|fin| {
+                        let ty = v
+                            .get("workflow/Type")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown")
+                            .to_lowercase()
+                            .replace(' ', "-");
+                        (fin, ty.into_boxed_str())
+                    });
+                    Some((id, label.to_string().into_boxed_str(), wf))
                 })
                 .unwrap_or_default()
             })
             .collect();
+        let mut enums: FxHashMap<u128, Box<str>> = FxHashMap::default();
+        let mut states: FxHashMap<u128, (bool, Box<str>)> = FxHashMap::default();
+        for (id, label, wf) in rows {
+            enums.insert(id, label);
+            if let Some(w) = wf {
+                states.insert(id, w);
+            }
+        }
         eprintln!(
-            "  enums      {:>9} labels from {} tables    ({:.1}s)",
+            "  enums      {:>9} labels from {} tables ({} workflow states) ({:.1}s)",
             enums.len(),
             enum_dbs.len(),
+            states.len(),
             t2.elapsed().as_secs_f64()
         );
 
@@ -235,6 +261,7 @@ impl Sidecars {
             docs,
             comments,
             enums,
+            states,
             inbound,
             mentions,
             users,
@@ -636,10 +663,18 @@ fn build_entity(
                     if let Some(label) = side.enums.get(&eid) {
                         let key = field_key(&fd.name);
                         d.add_text(f.enumv, scoped_term(&key, &label.to_lowercase()));
-                        // `workflow/state` drives `is:open` / `is:closed`.
                         if fd.name == "workflow/state" {
                             d.add_text(f.state, label.as_ref());
                             rec.state = Some(label.to_string());
+                            // `is:open` / `is:closed` come from the schema's
+                            // own terminal-state flag, not from state names.
+                            if let Some((is_final, ty)) = side.states.get(&eid) {
+                                d.add_text(
+                                    f.enumv,
+                                    scoped_term("workflow", if *is_final { "final" } else { "open" }),
+                                );
+                                d.add_text(f.enumv, scoped_term("workflow-type", ty));
+                            }
                         }
                     }
                 }

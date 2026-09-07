@@ -402,12 +402,16 @@ impl Engine {
         let searcher = self.reader.searcher();
         let f = &self.fields;
 
+        // Tantivy's TopDocs panics on a zero limit, and `--limit 0` is a
+        // legitimate way to ask "just count it".
+        let limit = spec.limit.max(1);
+
         // Ranking. Relevance keeps Tantivy's BM25 but nudges by inbound
         // reference count, so a widely-cited note beats an incidental mention.
         let (top, total, by_db) = match spec.sort {
             Sort::Relevance => {
                 let inbound_field = f.inbound;
-                let collector = TopDocs::with_limit(spec.limit).tweak_score(
+                let collector = TopDocs::with_limit(limit).tweak_score(
                     move |seg: &SegmentReader| {
                         let col = seg.fast_fields().u64("inbound").ok();
                         move |doc: DocId, score: Score| {
@@ -433,7 +437,7 @@ impl Engine {
                     Sort::Created => ("created_at", tantivy::Order::Desc),
                     _ => ("created_at", tantivy::Order::Asc),
                 };
-                let collector = TopDocs::with_limit(spec.limit)
+                let collector = TopDocs::with_limit(limit)
                     .order_by_fast_field::<DateTime>(field_name, order);
                 let (top, total, by_db) = searcher.search(
                     &query,
@@ -451,7 +455,7 @@ impl Engine {
         };
 
         let mut hits = Vec::with_capacity(top.len());
-        for (score, addr) in top {
+        for (score, addr) in top.into_iter().take(spec.limit) {
             let doc: TantivyDocument = searcher.doc(addr)?;
             let s = |field: tantivy::schema::Field| -> String {
                 doc.get_first(field)

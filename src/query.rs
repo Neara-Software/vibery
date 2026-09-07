@@ -501,19 +501,26 @@ impl Parser {
             }
 
             // --- misc -----------------------------------------------------
+            // `is:open` / `is:closed` resolve through the schema's own
+            // `workflow/Final` flag, so they work identically across all 347
+            // workflow tables however each one names its states.
             "is" | "state" | "status" => match val.to_lowercase().as_str() {
-                "open" | "active" | "todo" => Node::Not(Box::new(Node::Or(vec![
-                    Node::State("Done".into()),
-                    Node::State("Completed".into()),
-                    Node::State("Closed".into()),
-                    Node::State("Rejected".into()),
-                    Node::State("Cancelled".into()),
-                ]))),
-                "done" | "closed" | "complete" | "completed" => Node::Or(vec![
-                    Node::State("Done".into()),
-                    Node::State("Completed".into()),
-                    Node::State("Closed".into()),
-                ]),
+                "open" | "active" | "todo" | "unfinished" => Node::Enum {
+                    field: "workflow".into(),
+                    value: "open".into(),
+                },
+                "done" | "closed" | "complete" | "completed" | "finished" => Node::Enum {
+                    field: "workflow".into(),
+                    value: "final".into(),
+                },
+                "started" | "in-progress" | "wip" => Node::Enum {
+                    field: "workflow-type".into(),
+                    value: "started".into(),
+                },
+                "not-started" | "new" | "backlog" => Node::Enum {
+                    field: "workflow-type".into(),
+                    value: "not-started".into(),
+                },
                 other => Node::State(title_case(other)),
             },
             "has" => Node::Has(val.to_lowercase()),
