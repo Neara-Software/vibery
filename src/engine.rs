@@ -98,52 +98,40 @@ impl Engine {
 
     /// Resolve what someone typed after `@` to user ids.
     ///
-    /// Tiers, most specific first, so `@sami` does not also drag in everyone
-    /// whose surname happens to contain "sami".
+    /// Scored rather than tiered. The tiered version had a real bug: `@michael`
+    /// matched the `michael@fibery.io` service account on its email local part
+    /// and shadowed all nine humans called Michael. Matching a *name word*
+    /// therefore outranks matching an email local part.
     pub fn resolve_users(&self, needle: &str) -> Vec<(u128, &UserRec)> {
-        let n = needle.trim().trim_matches('"').to_lowercase().replace(['-', '_'], " ");
-        if n.is_empty() {
+        let raw = needle.trim().trim_matches('"').to_lowercase();
+        if raw.is_empty() {
             return Vec::new();
         }
-        if let Some(id) = parse_uuid(&n) {
+        // `michael.tokar` / `michael-tokar` should read as a full name too.
+        let norm = raw.replace(['-', '_', '.'], " ");
+
+        if let Some(id) = parse_uuid(&raw) {
             if let Some((i, u)) = self.users.iter().find(|(uid, _)| *uid == id) {
                 return vec![(*i, u)];
             }
         }
-        let name_of = |u: &UserRec| u.name.to_lowercase();
-        let mail_of = |u: &UserRec| u.email.to_lowercase();
 
-        // Tier 1: exact name, or the local part of the email.
-        let t1: Vec<(u128, &UserRec)> = self
+        let mut scored: Vec<(u32, bool, u128, &UserRec)> = self
             .users
             .iter()
-            .filter(|(_, u)| {
-                name_of(u) == n || mail_of(u).split('@').next().unwrap_or("") == n
+            .filter_map(|(id, u)| {
+                let sc = score_user(&raw, &norm, &u.name, &u.email);
+                (sc > 0).then_some((sc, u.active, *id, u))
             })
-            .map(|(i, u)| (*i, u))
             .collect();
-        if !t1.is_empty() {
-            return t1;
+        if scored.is_empty() {
+            return Vec::new();
         }
-        // Tier 2: any name word starts with the needle (first name, surname).
-        let t2: Vec<(u128, &UserRec)> = self
-            .users
-            .iter()
-            .filter(|(_, u)| {
-                let nm = name_of(u);
-                nm.split_whitespace().any(|w| w.starts_with(&n)) || mail_of(u).starts_with(&n)
-            })
-            .map(|(i, u)| (*i, u))
-            .collect();
-        if !t2.is_empty() {
-            return t2;
-        }
-        // Tier 3: the whole typed string appears somewhere in the name.
-        self.users
-            .iter()
-            .filter(|(_, u)| name_of(u).contains(&n))
-            .map(|(i, u)| (*i, u))
-            .collect()
+        let best = scored.iter().map(|(s, ..)| *s).max().unwrap_or(0);
+        scored.retain(|(s, ..)| *s == best);
+        // Active accounts first, then alphabetical, so output is stable.
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.name.cmp(&b.3.name)));
+        scored.into_iter().map(|(_, _, id, u)| (id, u)).collect()
     }
 
     // ------------------------------------------------------------ planning
@@ -313,14 +301,20 @@ impl Engine {
                     notes.push(format!("@{user} matched no user"));
                     return Ok(Box::new(EmptyQuery));
                 }
-                notes.push(format!(
-                    "@{user} -> {}",
-                    matched
-                        .iter()
-                        .map(|(_, u)| u.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+                let names: Vec<&str> =
+                    matched.iter().map(|(_, u)| u.name.as_str()).collect();
+                notes.push(if names.len() == 1 {
+                    format!("@{user} -> {}", names[0])
+                } else {
+                    // Ambiguity is surfaced, not silently resolved: the query
+                    // ORs over all of them and says so.
+                    format!(
+                        "@{user} -> {} users: {}{}",
+                        names.len(),
+                        names.iter().take(5).copied().collect::<Vec<_>>().join(", "),
+                        if names.len() > 5 { ", …" } else { "" }
+                    )
+                });
                 // Role-agnostic queries hit the `touched` edge, which every
                 // actor relationship also writes.
                 let roles: Vec<String> = match role.as_deref() {
@@ -677,5 +671,87 @@ impl SegmentCollector for DbCountSegment {
             }
         }
         out
+    }
+}
+
+/// Score how well a typed `@needle` identifies a user. 0 means no match.
+///
+/// Ordering matters more than the absolute numbers: an exact *name word*
+/// (someone's first or last name) must beat an exact email local part, or
+/// service accounts named after a common first name swallow the query.
+fn score_user(raw: &str, norm: &str, name: &str, email: &str) -> u32 {
+    let name_l = name.to_lowercase();
+    let email_l = email.to_lowercase();
+    let local = email_l.split('@').next().unwrap_or("");
+
+    if name_l == raw || name_l == norm {
+        return 100;
+    }
+    let words: Vec<&str> = name_l.split_whitespace().collect();
+    if words.iter().any(|w| *w == raw || *w == norm) {
+        return 90;
+    }
+    if local == raw || local.replace('.', " ") == norm {
+        return 80;
+    }
+    if words.iter().any(|w| w.starts_with(raw)) {
+        return 60;
+    }
+    if local.starts_with(raw) {
+        return 50;
+    }
+    if name_l.contains(raw) {
+        return 30;
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::score_user;
+
+    /// The bug this scoring model exists to fix.
+    #[test]
+    fn a_name_word_outranks_an_email_local_part() {
+        let human = score_user("michael", "michael", "Michael Tokar", "michael.tokar@neara.com");
+        let service = score_user("michael", "michael", "michael@fibery.io", "michael@fibery.io");
+        assert!(
+            human > service,
+            "humans ({human}) must outrank the service account ({service})"
+        );
+    }
+
+    #[test]
+    fn exact_full_name_wins_outright() {
+        assert_eq!(
+            score_user("sami kyostila", "sami kyostila", "Sami Kyostila", "sami@neara.com"),
+            100
+        );
+    }
+
+    #[test]
+    fn dotted_and_hyphenated_input_reads_as_a_full_name() {
+        // `@michael.tokar` -> normalised to "michael tokar" -> exact full name.
+        assert_eq!(
+            score_user("michael.tokar", "michael tokar", "Michael Tokar", "michael.tokar@neara.com"),
+            100
+        );
+    }
+
+    #[test]
+    fn surname_alone_resolves() {
+        assert_eq!(score_user("tokar", "tokar", "Michael Tokar", "michael.tokar@neara.com"), 90);
+    }
+
+    #[test]
+    fn prefixes_match_but_rank_lower_than_exact() {
+        let prefix = score_user("mich", "mich", "Michael Tokar", "michael.tokar@neara.com");
+        let exact = score_user("michael", "michael", "Michael Tokar", "michael.tokar@neara.com");
+        assert!(prefix > 0 && prefix < exact);
+    }
+
+    #[test]
+    fn unrelated_names_do_not_match() {
+        assert_eq!(score_user("zzzz", "zzzz", "Michael Tokar", "michael.tokar@neara.com"), 0);
     }
 }

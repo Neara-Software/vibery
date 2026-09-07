@@ -29,6 +29,8 @@ struct Sidecars {
     enums: FxHashMap<u128, Box<str>>,
     /// entity id -> number of inbound document references
     inbound: FxHashMap<u128, u32>,
+    /// entity id -> entities it is linked to by a document mention, both ways
+    mentions: FxHashMap<u128, Vec<u128>>,
     users: Vec<(u128, UserRec)>,
     text_bytes: u64,
 }
@@ -165,19 +167,35 @@ impl Sidecars {
         let t3 = std::time::Instant::now();
         let rpath = root.join("databases/Collaboration~Documents__Reference.jsonl");
         let mut inbound: FxHashMap<u128, u32> = FxHashMap::default();
+        let mut mentions: FxHashMap<u128, Vec<u128>> = FxHashMap::default();
         if rpath.exists() {
-            let tos: Vec<u128> = par_lines(&rpath, |line| {
+            let edges: Vec<(u128, u128)> = par_lines(&rpath, |line| {
                 let v: Value = serde_json::from_str(line).ok()?;
-                v.get("Collaboration~Documents/ToEntityId")?
+                let from = v
+                    .get("Collaboration~Documents/FromEntityId")?
                     .as_str()
-                    .and_then(parse_uuid)
+                    .and_then(parse_uuid)?;
+                let to = v
+                    .get("Collaboration~Documents/ToEntityId")?
+                    .as_str()
+                    .and_then(parse_uuid)?;
+                (from != to).then_some((from, to))
             })?;
-            for t in tos {
-                *inbound.entry(t).or_insert(0) += 1;
+            for (from, to) in edges {
+                *inbound.entry(to).or_insert(0) += 1;
+                // Symmetric: a mention relates the two entities in both
+                // directions, so `related:(X)` finds them from either side.
+                mentions.entry(from).or_default().push(to);
+                mentions.entry(to).or_default().push(from);
+            }
+            for v in mentions.values_mut() {
+                v.sort_unstable();
+                v.dedup();
             }
         }
         eprintln!(
-            "  backlinks  {:>9} referenced entities      ({:.1}s)",
+            "  mentions   {:>9} entities, {} referenced   ({:.1}s)",
+            mentions.len(),
             inbound.len(),
             t3.elapsed().as_secs_f64()
         );
@@ -218,6 +236,7 @@ impl Sidecars {
             comments,
             enums,
             inbound,
+            mentions,
             users,
             text_bytes,
         })
@@ -231,6 +250,23 @@ fn clean_text(s: &str) -> String {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
+        // Fibery entity mention: `[[label#^typeid/entityid]]` or
+        // `[[#@typeid/entityid]]`. Keep the label, drop the raw uuids — they
+        // are already in the index as `rel` terms and only add noise to text.
+        if b[i] == b'[' && i + 1 < b.len() && b[i + 1] == b'[' {
+            if let Some(close) = s[i..].find("]]") {
+                let inner = &s[i + 2..i + close];
+                let label = inner
+                    .find("#^")
+                    .or_else(|| inner.find("#@"))
+                    .map(|c| &inner[..c])
+                    .unwrap_or(inner);
+                out.push_str(label.trim());
+                out.push(' ');
+                i += close + 2;
+                continue;
+            }
+        }
         // `![alt](url)` -> drop entirely
         if b[i] == b'!' && i + 1 < b.len() && b[i + 1] == b'[' {
             if let Some(close) = s[i..].find(')') {
@@ -624,6 +660,13 @@ fn build_entity(
         }
     }
 
+    // Document mentions are relations too: "this note names that bet".
+    if let Some(ms) = side.mentions.get(&id) {
+        for m in ms {
+            d.add_text(f.rel, format_uuid(*m));
+        }
+    }
+
     // Role-agnostic actor edge, deduped.
     touched.sort_unstable();
     touched.dedup();
@@ -671,6 +714,28 @@ mod tests {
         assert_eq!(clean_text("see [the doc](http://x/y) now"), "see the doc now");
         assert_eq!(clean_text("a<br>\nb"), "a\n\nb");
         assert!(clean_text("<https://example.com/z>").contains("example.com/z"));
+    }
+
+    #[test]
+    fn entity_mentions_keep_their_label_and_drop_uuids() {
+        // Labelled mention: keep the readable part.
+        let labelled = clean_text(
+            "see [[Shared/Note: Fix the thing#^b85855a0-4515-11ed-959d-473694b08023/ff7dd5e2-0e50-4aeb-8ffe-9e20f2175e7b]] ok",
+        );
+        assert!(labelled.contains("Shared/Note: Fix the thing"), "got {labelled:?}");
+        assert!(!labelled.contains("b85855a0"), "uuid leaked: {labelled:?}");
+
+        // Bare user mention: nothing readable, so nothing kept.
+        let bare = clean_text(
+            "Author: [[#@1b728600-af9c-11e9-95b5-2985503542d7/dd81ef00-5605-11ef-a26a-692e722be878]]",
+        );
+        assert!(!bare.contains("1b728600"), "uuid leaked: {bare:?}");
+        assert_eq!(bare.trim(), "Author:");
+    }
+
+    #[test]
+    fn single_bracket_links_are_still_links() {
+        assert_eq!(clean_text("see [the doc](http://x/y) now"), "see the doc now");
     }
 
     #[test]

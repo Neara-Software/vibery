@@ -281,11 +281,25 @@ fn render(q: &str, spec: &Spec, res: &Results, explain: bool) {
     // The database breakdown is what makes "narrow it down" a keyboard move:
     // it tells you what `#…` to type next.
     if !res.by_db.is_empty() && res.by_db.len() > 1 {
+        // Two spaces can both define e.g. `Note`; showing "#Note 200 · #Note 200"
+        // is useless, so qualify a short name whenever it is ambiguous here.
+        let mut seen: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (d, _) in &res.by_db {
+            *seen.entry(catalog::short_name(d)).or_insert(0) += 1;
+        }
         let shown: Vec<String> = res
             .by_db
             .iter()
             .take(8)
-            .map(|(d, n)| format!("#{} {}", catalog::short_name(d), n))
+            .map(|(d, n)| {
+                let short = catalog::short_name(d);
+                if seen.get(short).copied().unwrap_or(0) > 1 {
+                    format!("#{d} {n}")
+                } else {
+                    format!("#{short} {n}")
+                }
+            })
             .collect();
         let more = res.by_db.len().saturating_sub(8);
         println!(

@@ -121,7 +121,12 @@ fn is_primitive_type(t: &str) -> bool {
 fn is_noise_field(name: &str) -> bool {
     matches!(
         name,
-        "fibery/rank" | "fibery/id" | "icon/icon" | "enum/color" | "enum/icon"
+        "fibery/rank"
+            | "fibery/id"
+            | "fibery/public-id"
+            | "icon/icon"
+            | "enum/color"
+            | "enum/icon"
     ) || name.ends_with("/rank")
 }
 
