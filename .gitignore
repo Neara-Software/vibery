@@ -1,3 +1,4 @@
 /target
 /index
 *.tmp
+.DS_Store
