@@ -12,6 +12,9 @@ use std::path::Path;
 const ENTITIES: TableDefinition<u128, &[u8]> = TableDefinition::new("entities");
 const USERS: TableDefinition<u128, &[u8]> = TableDefinition::new("users");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+/// Full folded prose per entity, for in-entity search (`vibery find`).
+/// Kept out of `entities` so ordinary result rendering never pays to decode it.
+const TEXTS: TableDefinition<u128, &[u8]> = TableDefinition::new("texts");
 
 /// Everything needed to render an entity, or to walk out of it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -46,6 +49,9 @@ pub struct Meta {
     pub entities_scanned: u64,
     pub documents_loaded: u64,
     pub comments_loaded: u64,
+    /// Of `comments_loaded`, how many had retrievable prose. Zero means the
+    /// dump carries comment authorship but not comment text.
+    pub comments_with_text: u64,
     pub text_bytes: u64,
     pub ingest_secs: f64,
     pub built_at: i64,
@@ -64,6 +70,7 @@ impl Store {
             w.open_table(ENTITIES)?;
             w.open_table(USERS)?;
             w.open_table(META)?;
+            w.open_table(TEXTS)?;
         }
         w.commit()?;
         Ok(Store { db })
@@ -104,6 +111,32 @@ impl Store {
         }
         w.commit()?;
         Ok(())
+    }
+
+    /// Store folded prose and comment text for one entity.
+    pub fn put_texts(&self, batch: &[(u128, String, String)]) -> Result<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(TEXTS)?;
+            let mut buf = Vec::with_capacity(4096);
+            for (id, body, comments) in batch {
+                buf.clear();
+                bincode::serialize_into(&mut buf, &(body, comments))?;
+                t.insert(*id, buf.as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// `(body, comments)` for one entity, if any was indexed.
+    pub fn get_texts(&self, id: u128) -> Result<Option<(String, String)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(TEXTS)?;
+        Ok(match t.get(id)? {
+            Some(v) => Some(bincode::deserialize(v.value())?),
+            None => None,
+        })
     }
 
     pub fn get_entity(&self, id: u128) -> Result<Option<EntityRec>> {

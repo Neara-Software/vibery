@@ -39,6 +39,8 @@ struct Sidecars {
     mentions: FxHashMap<u128, Vec<u128>>,
     users: Vec<(u128, UserRec)>,
     text_bytes: u64,
+    /// How many comment threads had prose we could actually retrieve.
+    comments_with_text: u64,
 }
 
 /// Read a file and hand each line to `f` in parallel.
@@ -130,11 +132,35 @@ impl Sidecars {
         } else {
             FxHashMap::default()
         };
+        // A comment's text lives in its own document, keyed by
+        // `comment/document-secret`. Those secrets are NOT the same population
+        // as the Document rows' secrets, so a dump that only fetched the latter
+        // has comment *authorship* but no comment *prose*. Detect and report
+        // that rather than silently indexing an empty field.
+        let with_text = comments
+            .values()
+            .filter(|(_, sec)| sec.is_some_and(|s| docs.contains_key(&s)))
+            .count();
         eprintln!(
-            "  comments   {:>9} threads                 ({:.1}s)",
+            "  comments   {:>9} threads, {} with retrievable text  ({:.1}s)",
             comments.len(),
+            with_text,
             t1.elapsed().as_secs_f64()
         );
+        if comments.len() > 1000 && with_text * 20 < comments.len() {
+            eprintln!(
+                "             \x1b[33mnote: comment prose is absent from this dump\x1b[0m"
+            );
+            eprintln!(
+                "             \x1b[2m`commented-by:` still works (authorship comes from the"
+            );
+            eprintln!(
+                "             comment rows); `comments:<term>` cannot match anything until"
+            );
+            eprintln!(
+                "             the scraper also fetches comment/document-secret bodies.\x1b[2m\x1b[0m"
+            );
+        }
 
         // --- enum labels -------------------------------------------------
         let t2 = std::time::Instant::now();
@@ -266,6 +292,7 @@ impl Sidecars {
             mentions,
             users,
             text_bytes,
+            comments_with_text: with_text as u64,
         })
     }
 }
@@ -409,6 +436,11 @@ pub fn run(opts: &IngestOpts) -> Result<Meta> {
     std::fs::create_dir_all(&tv_path)?;
     let (schema, f) = build_schema();
     let index = Index::create_in_dir(&tv_path, schema)?;
+    // Must happen before the writer is built: the schema names this tokenizer
+    // for title/body/comments, and an unregistered name is a hard error.
+    index
+        .tokenizers()
+        .register(crate::text::TOKENIZER, crate::text::analyzer());
     let writer = index.writer_with_num_threads(
         opts.threads.clamp(1, 8),
         opts.heap_mb * 1_000_000,
@@ -447,6 +479,7 @@ pub fn run(opts: &IngestOpts) -> Result<Meta> {
             let text = String::from_utf8_lossy(&bytes);
 
             let mut batch: Vec<(u128, EntityRec)> = Vec::with_capacity(4096);
+            let mut texts: Vec<(u128, String, String)> = Vec::with_capacity(4096);
             let mut n = 0usize;
 
             for line in text.lines() {
@@ -471,19 +504,27 @@ pub fn run(opts: &IngestOpts) -> Result<Meta> {
                 };
 
                 let built = build_entity(db, dbi, id, &v, &side, &f, &intern);
-                if let Some((tdoc, rec)) = built {
+                if let Some((tdoc, rec, body, comments)) = built {
                     writer.add_document(tdoc)?;
                     batch.push((id, rec));
+                    if !body.is_empty() || !comments.is_empty() {
+                        texts.push((id, body, comments));
+                    }
                     indexed.fetch_add(1, Ordering::Relaxed);
                 }
 
                 if batch.len() >= 4096 {
                     store.put_entities(&batch)?;
                     batch.clear();
+                    store.put_texts(&texts)?;
+                    texts.clear();
                 }
             }
             if !batch.is_empty() {
                 store.put_entities(&batch)?;
+            }
+            if !texts.is_empty() {
+                store.put_texts(&texts)?;
             }
             Ok(())
         })
@@ -511,6 +552,7 @@ pub fn run(opts: &IngestOpts) -> Result<Meta> {
         entities_scanned: scanned.load(Ordering::Relaxed),
         documents_loaded: side.docs.len() as u64,
         comments_loaded: side.comments.len() as u64,
+        comments_with_text: side.comments_with_text,
         text_bytes: side.text_bytes,
         ingest_secs: t_start.elapsed().as_secs_f64(),
         built_at: now_secs(),
@@ -530,7 +572,7 @@ fn build_entity(
     side: &Sidecars,
     f: &Fields,
     intern: &dyn Fn(&str) -> u32,
-) -> Option<(TantivyDocument, EntityRec)> {
+) -> Option<(TantivyDocument, EntityRec, String, String)> {
     let mut d = TantivyDocument::default();
     let id_str = format_uuid(id);
     d.add_text(f.id, &id_str);
@@ -590,6 +632,7 @@ fn build_entity(
     let mut body = String::new();
     let mut comment_text = String::new();
     let mut has_description = false;
+    let mut rank_flags: u64 = 0;
     let mut ids_buf: Vec<u128> = Vec::new();
 
     for fd in &db.fields {
@@ -674,6 +717,12 @@ fn build_entity(
                                     scoped_term("workflow", if *is_final { "final" } else { "open" }),
                                 );
                                 d.add_text(f.enumv, scoped_term("workflow-type", ty));
+                                if *is_final {
+                                    rank_flags |= crate::index::flags::FINAL;
+                                }
+                                if ty.as_ref() == "not-started" {
+                                    rank_flags |= crate::index::flags::NOT_STARTED;
+                                }
                             }
                         }
                     }
@@ -736,7 +785,15 @@ fn build_entity(
     let inb = side.inbound.get(&id).copied().unwrap_or(0);
     d.add_u64(f.inbound, inb as u64);
 
-    Some((d, rec))
+    // Ranking inputs: how much substance the entity has, and its lifecycle.
+    let text_len = (body.len() + comment_text.len()) as u64;
+    d.add_u64(f.text_len, text_len);
+    if !body.trim().is_empty() {
+        rank_flags |= crate::index::flags::HAS_BODY;
+    }
+    d.add_u64(f.rank_flags, rank_flags);
+
+    Some((d, rec, body, comment_text))
 }
 
 #[cfg(test)]

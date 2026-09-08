@@ -193,15 +193,21 @@ pub enum Node {
     And(Vec<Node>),
     Or(Vec<Node>),
     Not(Box<Node>),
-    /// A single word. `prefix` is set by a trailing `*`, which is also what
-    /// incremental "search as I type" uses for the word being typed.
+    /// One typed word, unanalysed. The engine runs it through the same
+    /// analyzer the index used, so `DataView` becomes the phrase `data view`
+    /// and matches a title written `Data Views`.
+    ///
+    /// `prefix` comes from a trailing `*` (incremental search-as-you-type);
+    /// `fuzzy` from a trailing `~` or `~2`.
     Word {
-        word: String,
+        raw: String,
         scope: TextScope,
         prefix: bool,
+        fuzzy: Option<u8>,
     },
+    /// A quoted phrase, unanalysed; matched in order.
     Phrase {
-        words: Vec<String>,
+        raw: String,
         scope: TextScope,
     },
     /// Resolved at plan time against the catalog, so `#bet` -> `Engineering/Bet`.
@@ -247,6 +253,9 @@ pub struct Spec {
     pub limit: usize,
     /// Databases to group counts by, for the facet summary.
     pub facets: bool,
+    /// Automatically add a distance-1 fuzzy clause to long words, so
+    /// `subdivide` finds `subdivision`. Turn off with `fuzzy:off`.
+    pub fuzzy: bool,
 }
 
 impl Default for Spec {
@@ -256,6 +265,7 @@ impl Default for Spec {
             sort: Sort::Relevance,
             limit: 20,
             facets: true,
+            fuzzy: true,
         }
     }
 }
@@ -267,6 +277,7 @@ pub struct Parser {
     pos: usize,
     pub sort: Option<Sort>,
     pub limit: Option<usize>,
+    pub fuzzy: Option<bool>,
     pub warnings: Vec<String>,
 }
 
@@ -277,6 +288,7 @@ impl Parser {
             pos: 0,
             sort: None,
             limit: None,
+            fuzzy: None,
             warnings: Vec::new(),
         }
     }
@@ -290,6 +302,7 @@ impl Parser {
             sort,
             limit: p.limit.unwrap_or(20),
             facets: true,
+            fuzzy: p.fuzzy.unwrap_or(true),
         };
         (spec, p.warnings)
     }
@@ -434,6 +447,17 @@ impl Parser {
                 });
                 return None;
             }
+            "fuzzy" | "strict" => {
+                let on = matches!(val.to_lowercase().as_str(), "on" | "1" | "true" | "yes");
+                let off = matches!(val.to_lowercase().as_str(), "off" | "0" | "false" | "no");
+                if !on && !off {
+                    self.warnings.push(format!("`{key}:` expects on/off, got `{val}`"));
+                } else {
+                    // `strict:on` is the inverse of `fuzzy:on`.
+                    self.fuzzy = Some(if key == "strict" { off } else { on });
+                }
+                return None;
+            }
             "limit" | "top" | "n" => {
                 match val.parse::<usize>() {
                     Ok(n) => self.limit = Some(n.clamp(1, 1000)),
@@ -565,61 +589,78 @@ fn title_case(s: &str) -> String {
     }
 }
 
-/// Split text the same way Tantivy's `default` tokenizer does: on
-/// non-alphanumeric boundaries, lowercased, dropping over-long tokens.
-pub fn tokenize(s: &str) -> Vec<String> {
-    s.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty() && t.len() <= 40)
-        .map(|t| t.to_lowercase())
+/// Split on whitespace only. Real analysis (camelCase, stemming) happens in
+/// `text.rs`, against the very analyzer the index was built with.
+pub fn split_words(s: &str) -> Vec<String> {
+    s.split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
         .collect()
 }
 
+/// Strip and interpret the `*` (prefix) and `~`/`~N` (fuzzy) suffixes.
+fn suffixes(raw: &str) -> (String, bool, Option<u8>) {
+    let mut base = raw;
+    let mut prefix = false;
+    let mut fuzzy = None;
+
+    if let Some(i) = base.rfind('~') {
+        let (head, tail) = base.split_at(i);
+        let digits = &tail[1..];
+        if digits.is_empty() {
+            fuzzy = Some(1);
+            base = head;
+        } else if let Ok(n) = digits.parse::<u8>() {
+            fuzzy = Some(n.clamp(1, 2));
+            base = head;
+        }
+    }
+    if base.ends_with('*') {
+        prefix = true;
+        base = base.trim_end_matches('*');
+    }
+    (base.to_string(), prefix, fuzzy)
+}
+
 fn word_node(raw: &str, scope: TextScope) -> Node {
-    let prefix = raw.ends_with('*');
-    let base = raw.trim_end_matches('*');
-    let toks = tokenize(base);
-    match toks.len() {
-        0 => Node::All,
-        1 => Node::Word {
-            word: toks.into_iter().next().expect("len checked"),
-            scope,
-            prefix,
-        },
-        // A "word" that tokenizes into several (e.g. `foo.bar`) is a phrase.
-        _ => Node::Phrase { words: toks, scope },
+    let (base, prefix, fuzzy) = suffixes(raw);
+    // A word with no alphanumeric content ("/", "-", "—") analyses to zero
+    // tokens. Treating it as a term would make the whole conjunction
+    // unsatisfiable, so it has to be a no-op instead: `title:"Keycloak / SCIM"`
+    // must not be broken by its slash.
+    if !base.chars().any(|c| c.is_alphanumeric()) {
+        return Node::All;
+    }
+    Node::Word {
+        raw: base,
+        scope,
+        prefix,
+        fuzzy,
     }
 }
 
 fn phrase_node(raw: &str, scope: TextScope) -> Node {
-    let toks = tokenize(raw);
-    match toks.len() {
-        0 => Node::All,
-        1 => Node::Word {
-            word: toks.into_iter().next().expect("len checked"),
-            scope,
-            prefix: false,
-        },
-        _ => Node::Phrase { words: toks, scope },
+    if raw.trim().is_empty() {
+        return Node::All;
+    }
+    if split_words(raw).len() < 2 {
+        return word_node(raw.trim(), scope);
+    }
+    Node::Phrase {
+        raw: raw.to_string(),
+        scope,
     }
 }
 
+/// `title:keycloak` — a field-scoped value. A multi-word value (only possible
+/// when quoted) reads as "all these words in that field", in any order, which
+/// is friendlier than a strict phrase for a filter.
 fn scoped_text(val: &str, scope: TextScope) -> Node {
-    let toks = tokenize(val);
-    if toks.len() > 1 {
-        // `title:"a b"` was already unquoted by the lexer; treat multi-token
-        // values as an AND of words rather than a strict phrase, which is the
-        // friendlier reading for a field filter.
-        Node::And(
-            toks.into_iter()
-                .map(|w| Node::Word {
-                    word: w,
-                    scope,
-                    prefix: false,
-                })
-                .collect(),
-        )
-    } else {
-        word_node(val, scope)
+    let words = split_words(val);
+    match words.len() {
+        0 => Node::All,
+        1 => word_node(&words[0], scope),
+        _ => Node::And(words.iter().map(|w| word_node(w, scope)).collect()),
     }
 }
 
@@ -806,9 +847,10 @@ mod tests {
         assert_eq!(
             spec.root,
             Node::Word {
-                word: "interventions".into(),
+                raw: "interventions".into(),
                 scope: TextScope::Any,
-                prefix: false
+                prefix: false,
+                fuzzy: None
             }
         );
     }
@@ -854,11 +896,75 @@ mod tests {
         assert_eq!(
             spec.root,
             Node::Word {
-                word: "interv".into(),
+                raw: "interv".into(),
                 scope: TextScope::Any,
-                prefix: true
+                prefix: true,
+                fuzzy: None
             }
         );
+    }
+
+    #[test]
+    fn punctuation_only_words_are_no_ops_not_impossible_terms() {
+        // `title:"Keycloak / SCIM Uplift"` must not be defeated by the slash.
+        let (spec, _) = Parser::parse("title:\"Keycloak / SCIM Uplift\"");
+        let Node::And(parts) = &spec.root else {
+            panic!("expected And, got {:?}", spec.root);
+        };
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[1], Node::All, "the slash should be a no-op");
+        assert!(matches!(parts[0], Node::Word { .. }));
+        assert!(matches!(parts[3], Node::Word { .. }));
+    }
+
+    #[test]
+    fn tilde_marks_an_explicit_fuzzy_word() {
+        let (spec, _) = Parser::parse("subdivide~");
+        assert_eq!(
+            spec.root,
+            Node::Word {
+                raw: "subdivide".into(),
+                scope: TextScope::Any,
+                prefix: false,
+                fuzzy: Some(1)
+            }
+        );
+        let (spec2, _) = Parser::parse("subdivide~2");
+        assert!(matches!(spec2.root, Node::Word { fuzzy: Some(2), .. }));
+    }
+
+    #[test]
+    fn fuzzy_is_on_by_default_and_can_be_turned_off() {
+        let (a, _) = Parser::parse("subdivide");
+        assert!(a.fuzzy);
+        let (b, w) = Parser::parse("subdivide fuzzy:off");
+        assert!(w.is_empty(), "unexpected warnings: {w:?}");
+        assert!(!b.fuzzy);
+        let (c, _) = Parser::parse("subdivide strict:on");
+        assert!(!c.fuzzy);
+    }
+
+    #[test]
+    fn camel_case_input_is_preserved_for_the_analyzer() {
+        // The parser must NOT lowercase or split; text.rs owns that.
+        let (spec, _) = Parser::parse("DataView");
+        assert_eq!(
+            spec.root,
+            Node::Word {
+                raw: "DataView".into(),
+                scope: TextScope::Any,
+                prefix: false,
+                fuzzy: None
+            }
+        );
+    }
+
+    #[test]
+    fn quoted_multiword_is_a_phrase_single_word_is_not() {
+        let (a, _) = Parser::parse("\"load flow\"");
+        assert!(matches!(a.root, Node::Phrase { .. }));
+        let (b, _) = Parser::parse("\"keycloak\"");
+        assert!(matches!(b.root, Node::Word { .. }));
     }
 
     #[test]

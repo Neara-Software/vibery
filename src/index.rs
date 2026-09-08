@@ -14,9 +14,10 @@
 //!    We fold both into `body`/`comments` on the entity itself, so one term
 //!    lookup finds the thing you were actually looking for.
 
+use crate::text::TOKENIZER;
 use tantivy::schema::{
     DateOptions, Field, IndexRecordOption, NumericOptions, Schema, TextFieldIndexing,
-    TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
+    TextOptions, FAST, INDEXED, STORED, STRING,
 };
 
 /// Named handles onto the Tantivy schema, resolved once.
@@ -47,6 +48,22 @@ pub struct Fields {
     pub state: Field,
     /// Number of inbound references — a cheap authority signal for ranking.
     pub inbound: Field,
+    /// Length of the folded prose, in bytes: the "is this detailed?" signal.
+    pub text_len: Field,
+    /// Ranking bitset; see [`flags`].
+    pub rank_flags: Field,
+}
+
+/// Bits in the `rank_flags` fast field. Kept as one packed u64 so the scoring
+/// closure reads a single column instead of several.
+pub mod flags {
+    /// Workflow type is "Not started" — the note asks for these to be
+    /// deprioritised rather than hidden.
+    pub const NOT_STARTED: u64 = 1 << 0;
+    /// Workflow state is terminal.
+    pub const FINAL: u64 = 1 << 1;
+    /// Has prose of its own.
+    pub const HAS_BODY: u64 = 1 << 2;
 }
 
 pub fn build_schema() -> (Schema, Fields) {
@@ -58,19 +75,20 @@ pub fn build_schema() -> (Schema, Fields) {
     let db = sb.add_text_field("db", STRING | STORED | FAST);
     let space = sb.add_text_field("space", STRING | STORED | FAST);
 
-    // Tokenised prose. `title` is stored so results can be rendered without a
-    // second lookup; `body`/`comments` are index-only (we store a short
-    // snippet separately rather than the whole document).
+    // Tokenised prose, all three through the camelCase+stemming analyzer.
+    // Positions are indexed everywhere because a phrase query is how a
+    // camelCase input like `DataView` matches a title written `Data Views`.
+    let indexing = TextFieldIndexing::default()
+        .set_tokenizer(TOKENIZER)
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let title_opts: TextOptions = TextOptions::default()
         .set_stored()
-        .set_indexing_options(
-            TextFieldIndexing::default()
-                .set_tokenizer("default")
-                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-        );
+        .set_indexing_options(indexing.clone());
+    let text_opts: TextOptions =
+        TextOptions::default().set_indexing_options(indexing);
     let title = sb.add_text_field("title", title_opts);
-    let body = sb.add_text_field("body", TEXT);
-    let comments = sb.add_text_field("comments", TEXT);
+    let body = sb.add_text_field("body", text_opts.clone());
+    let comments = sb.add_text_field("comments", text_opts);
 
     // Structural facets. Multi-valued simply by adding the field twice.
     let actor = sb.add_text_field("actor", STRING);
@@ -89,10 +107,10 @@ pub fn build_schema() -> (Schema, Fields) {
 
     let snippet = sb.add_text_field("snippet", STORED);
     let state = sb.add_text_field("state", STRING | STORED);
-    let inbound = sb.add_u64_field(
-        "inbound",
-        NumericOptions::default().set_stored().set_fast(),
-    );
+    let numeric = NumericOptions::default().set_stored().set_fast();
+    let inbound = sb.add_u64_field("inbound", numeric.clone());
+    let text_len = sb.add_u64_field("text_len", numeric.clone());
+    let rank_flags = sb.add_u64_field("rank_flags", numeric);
 
     let schema = sb.build();
     let fields = Fields {
@@ -113,6 +131,8 @@ pub fn build_schema() -> (Schema, Fields) {
         snippet,
         state,
         inbound,
+        text_len,
+        rank_flags,
     };
     (schema, fields)
 }
@@ -143,6 +163,8 @@ impl Fields {
             snippet: g("snippet")?,
             state: g("state")?,
             inbound: g("inbound")?,
+            text_len: g("text_len")?,
+            rank_flags: g("rank_flags")?,
         })
     }
 }

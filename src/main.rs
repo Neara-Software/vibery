@@ -12,6 +12,7 @@ mod index;
 mod ingest;
 mod query;
 mod store;
+mod text;
 mod util;
 
 use anyhow::{Context, Result};
@@ -72,6 +73,9 @@ enum Cmd {
         /// One line per hit, tab-separated: id, db, updated, title.
         #[arg(long)]
         terse: bool,
+        /// Disable automatic fuzzy matching on long words.
+        #[arg(long)]
+        strict: bool,
     },
 
     /// "What has this person been working on?" — a cross-database activity feed.
@@ -99,6 +103,23 @@ enum Cmd {
 
     /// Show the parsed AST and compiled query without running it.
     Explain { query: Vec<String> },
+
+    /// Ctrl-F inside one entity: find a term in its prose *and* its comment feed.
+    Find {
+        /// Entity UUID, public id, or title.
+        target: String,
+        /// Term or phrase to find.
+        term: Vec<String>,
+        /// Disambiguate by database.
+        #[arg(long)]
+        db: Option<String>,
+        /// Lines of context around each match.
+        #[arg(long, short = 'C', default_value_t = 0)]
+        context: usize,
+    },
+
+    /// List curated search pins (from `<index>/pins.json`).
+    Pins,
 
     /// Time the queries from the search-issues note.
     Bench {
@@ -151,7 +172,10 @@ fn real_main() -> Result<()> {
             println!("  {:>10} entities scanned", meta.entities_scanned);
             println!("  {:>10} entities indexed", meta.entities_indexed);
             println!("  {:>10} prose documents folded in", meta.documents_loaded);
-            println!("  {:>10} comment threads folded in", meta.comments_loaded);
+            println!(
+                "  {:>10} comment threads folded in ({} with text)",
+                meta.comments_loaded, meta.comments_with_text
+            );
             println!("  {:>10} MB of text", meta.text_bytes / 1_000_000);
             println!("  index at {}", cli.index.display());
             Ok(())
@@ -163,12 +187,16 @@ fn real_main() -> Result<()> {
             sort,
             explain,
             terse,
+            strict,
         } => {
             let eng = Engine::open(&cli.index)?;
             let q = query.join(" ");
             let (mut spec, warns) = Parser::parse(&q);
             if let Some(n) = limit {
                 spec.limit = *n;
+            }
+            if *strict {
+                spec.fuzzy = false;
             }
             if let Some(s) = sort {
                 spec.sort = match s.as_str() {
@@ -212,6 +240,35 @@ fn real_main() -> Result<()> {
             Ok(())
         }
 
+        Cmd::Find {
+            target,
+            term,
+            db,
+            context,
+        } => find(&cli.index, target, &term.join(" "), db.as_deref(), *context),
+
+        Cmd::Pins => {
+            let eng = Engine::open(&cli.index)?;
+            if eng.pins.is_empty() {
+                println!("no pins configured");
+                println!("create {}/pins.json:", cli.index.display());
+                println!("{PINS_EXAMPLE}");
+                return Ok(());
+            }
+            println!("{} pin(s):", eng.pins.len());
+            for p in &eng.pins {
+                let title = parse_uuid(&p.id)
+                    .and_then(|id| eng.entity(id).ok().flatten())
+                    .map(|r| r.title)
+                    .unwrap_or_else(|| "(not in index)".into());
+                println!("  {:<40} -> {}", p.terms.join(" | "), title);
+                if !p.why.is_empty() {
+                    println!("      \x1b[2m{}\x1b[0m", p.why);
+                }
+            }
+            Ok(())
+        }
+
         Cmd::Bench { iters } => bench(&cli.index, *iters),
         Cmd::Repl => repl(&cli.index),
 
@@ -246,7 +303,10 @@ fn real_main() -> Result<()> {
             println!("entities seen   {}", m.entities_scanned);
             println!("entities index  {}", m.entities_indexed);
             println!("prose docs      {}", m.documents_loaded);
-            println!("comments        {}", m.comments_loaded);
+            println!(
+                "comments        {} ({} with retrievable text)",
+                m.comments_loaded, m.comments_with_text
+            );
             println!("text            {} MB", m.text_bytes / 1_000_000);
             println!("segments        {}", searcher.segment_readers().len());
             println!("indexed docs    {}", searcher.num_docs());
@@ -326,8 +386,9 @@ fn render(q: &str, spec: &Spec, res: &Results, explain: bool) {
             &h.title
         };
         println!(
-            "{:>3}. \x1b[1;36m{}\x1b[0m",
+            "{:>3}. {}\x1b[1;36m{}\x1b[0m",
             i + 1,
+            if h.pinned { "\x1b[1;32m📌 PINNED\x1b[0m " } else { "" },
             truncate(title, 100)
         );
         let mut meta = vec![format!("\x1b[33m{}\x1b[0m", h.db)];
@@ -474,48 +535,8 @@ fn activity(index: &std::path::Path, who: &str, days: i64, limit: usize, by_role
 /// "Where am I?" — the context an entity sits in, plus what points at it.
 fn locate(index: &std::path::Path, target: &str, db: Option<&str>) -> Result<()> {
     let eng = Engine::open(index)?;
-
-    let id = match parse_uuid(target) {
-        Some(v) => v,
-        None => {
-            // A public id is only unique *within* a database in Fibery, so this
-            // can legitimately match several entities. Fall back to a title
-            // search when it looks like text rather than a number.
-            // Quote it: database names contain spaces (`Exchange Rate`), and an
-            // unquoted `#exchange rate` would lex `rate` as a free-text word.
-            let dbq = db.map(|d| format!(" #\"{d}\"")).unwrap_or_default();
-            let q = if target.chars().all(|c| c.is_ascii_digit()) {
-                format!("pid:{target}{dbq}")
-            } else {
-                format!("title:\"{target}\"{dbq}")
-            };
-            let (spec, warns) = Parser::parse(&q);
-            let res = eng.search(&Spec { limit: 10, ..spec }, warns)?;
-            match res.hits.len() {
-                0 => anyhow::bail!(
-                    "nothing found for `{target}`{}",
-                    db.map(|d| format!(" in #{d}")).unwrap_or_default()
-                ),
-                1 => parse_uuid(&res.hits[0].id).context("bad id in index")?,
-                _ => {
-                    println!();
-                    println!(
-                        "`{target}` matches {} entities — narrow it with --db, or pass a uuid:",
-                        res.total
-                    );
-                    for h in &res.hits {
-                        println!(
-                            "  \x1b[33m{:<44}\x1b[0m {}  \x1b[2m{}\x1b[0m",
-                            h.db,
-                            truncate(if h.title.is_empty() { "(untitled)" } else { &h.title }, 50),
-                            h.id
-                        );
-                    }
-                    println!();
-                    return Ok(());
-                }
-            }
-        }
+    let Some(id) = resolve_entity(&eng, target, db)? else {
+        return Ok(());
     };
 
     let rec = eng
@@ -591,6 +612,162 @@ fn locate(index: &std::path::Path, target: &str, db: Option<&str>) -> Result<()>
     println!();
     Ok(())
 }
+
+// ------------------------------------------------------------------ find
+
+/// In-entity search — the Ctrl-F complaint.
+///
+/// *"you can't hit Ctrl-F to find stuff in a single entity reliably, especially
+/// in entity feeds"*. The feed is the hard part: an entity's discussion lives
+/// in separate comment rows, so a browser Ctrl-F only sees what is currently
+/// rendered. Ingest already folded all of it onto the entity, so we can search
+/// the whole thing including every comment.
+fn find(
+    index: &std::path::Path,
+    target: &str,
+    term: &str,
+    db: Option<&str>,
+    context: usize,
+) -> Result<()> {
+    let eng = Engine::open(index)?;
+    let id = resolve_entity(&eng, target, db)?;
+    let Some(id) = id else { return Ok(()) };
+
+    let rec = eng
+        .entity(id)?
+        .with_context(|| format!("no entity {}", format_uuid(id)))?;
+    let (body, comments) = eng.store.get_texts(id)?.unwrap_or_default();
+
+    println!();
+    println!(
+        "\x1b[1;36m{}\x1b[0m  \x1b[2m{} #{}\x1b[0m",
+        if rec.title.is_empty() { "(untitled)" } else { &rec.title },
+        eng.db_name(rec.db),
+        rec.public_id
+    );
+    if term.trim().is_empty() {
+        println!(
+            "  {} chars of prose, {} chars of comments. Pass a term to search.",
+            body.len(),
+            comments.len()
+        );
+        println!();
+        return Ok(());
+    }
+
+    let needle = term.to_lowercase();
+    let mut total = 0usize;
+    for (label, text) in [("prose", &body), ("comments", &comments)] {
+        if text.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let mut shown = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if !line.to_lowercase().contains(&needle) {
+                continue;
+            }
+            total += 1;
+            if shown == 0 {
+                println!();
+                println!("  \x1b[1;35m{label}\x1b[0m");
+            }
+            shown += 1;
+            let lo = i.saturating_sub(context);
+            let hi = (i + context + 1).min(lines.len());
+            for (j, l) in lines[lo..hi].iter().enumerate() {
+                let n = lo + j + 1;
+                let is_hit = lo + j == i;
+                let text = truncate(l.trim(), 150);
+                if is_hit {
+                    println!("  \x1b[2m{n:>5}\x1b[0m  {}", highlight(&text, &needle));
+                } else {
+                    println!("  \x1b[2m{n:>5}  {text}\x1b[0m");
+                }
+            }
+        }
+    }
+    println!();
+    println!(
+        "  {} match{} for \x1b[1m{term}\x1b[0m",
+        total,
+        if total == 1 { "" } else { "es" }
+    );
+    println!();
+    Ok(())
+}
+
+/// Case-insensitive highlight of every occurrence.
+fn highlight(line: &str, needle: &str) -> String {
+    let lower = line.to_lowercase();
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut at = 0usize;
+    while let Some(rel) = lower[at..].find(needle) {
+        let start = at + rel;
+        let end = start + needle.len();
+        out.push_str(&line[at..start]);
+        out.push_str("\x1b[1;33m");
+        out.push_str(&line[start..end]);
+        out.push_str("\x1b[0m");
+        at = end;
+    }
+    out.push_str(&line[at..]);
+    out
+}
+
+/// Resolve a uuid / public id / title to one entity, printing the candidates
+/// and returning `None` when it is ambiguous.
+fn resolve_entity(
+    eng: &Engine,
+    target: &str,
+    db: Option<&str>,
+) -> Result<Option<u128>> {
+    if let Some(v) = parse_uuid(target) {
+        return Ok(Some(v));
+    }
+    let dbq = db.map(|d| format!(" #\"{d}\"")).unwrap_or_default();
+    let q = if target.chars().all(|c| c.is_ascii_digit()) {
+        format!("pid:{target}{dbq}")
+    } else {
+        format!("title:\"{target}\"{dbq}")
+    };
+    let (spec, warns) = Parser::parse(&q);
+    let res = eng.search(&Spec { limit: 10, ..spec }, warns)?;
+    match res.hits.len() {
+        0 => anyhow::bail!(
+            "nothing found for `{target}`{}",
+            db.map(|d| format!(" in #{d}")).unwrap_or_default()
+        ),
+        1 => Ok(Some(parse_uuid(&res.hits[0].id).context("bad id in index")?)),
+        _ => {
+            println!();
+            println!(
+                "`{target}` matches {} entities — narrow it with --db, or pass a uuid:",
+                res.total
+            );
+            for h in &res.hits {
+                println!(
+                    "  \x1b[33m{:<44}\x1b[0m {}  \x1b[2m{}\x1b[0m",
+                    h.db,
+                    truncate(if h.title.is_empty() { "(untitled)" } else { &h.title }, 50),
+                    h.id
+                );
+            }
+            println!();
+            Ok(None)
+        }
+    }
+}
+
+const PINS_EXAMPLE: &str = r#"
+[
+  {
+    "terms": ["claude", "claude code"],
+    "id": "00000000-0000-0000-0000-000000000000",
+    "why": "canonical onboarding guide"
+  }
+]
+"#;
 
 // ----------------------------------------------------------------- bench
 
