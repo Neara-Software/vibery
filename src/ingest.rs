@@ -479,7 +479,6 @@ pub fn run(opts: &IngestOpts) -> Result<Meta> {
             let text = String::from_utf8_lossy(&bytes);
 
             let mut batch: Vec<(u128, EntityRec)> = Vec::with_capacity(4096);
-            let mut texts: Vec<(u128, String, String)> = Vec::with_capacity(4096);
             let mut n = 0usize;
 
             for line in text.lines() {
@@ -504,27 +503,19 @@ pub fn run(opts: &IngestOpts) -> Result<Meta> {
                 };
 
                 let built = build_entity(db, dbi, id, &v, &side, &f, &intern);
-                if let Some((tdoc, rec, body, comments)) = built {
+                if let Some((tdoc, rec)) = built {
                     writer.add_document(tdoc)?;
                     batch.push((id, rec));
-                    if !body.is_empty() || !comments.is_empty() {
-                        texts.push((id, body, comments));
-                    }
                     indexed.fetch_add(1, Ordering::Relaxed);
                 }
 
                 if batch.len() >= 4096 {
                     store.put_entities(&batch)?;
                     batch.clear();
-                    store.put_texts(&texts)?;
-                    texts.clear();
                 }
             }
             if !batch.is_empty() {
                 store.put_entities(&batch)?;
-            }
-            if !texts.is_empty() {
-                store.put_texts(&texts)?;
             }
             Ok(())
         })
@@ -572,7 +563,7 @@ fn build_entity(
     side: &Sidecars,
     f: &Fields,
     intern: &dyn Fn(&str) -> u32,
-) -> Option<(TantivyDocument, EntityRec, String, String)> {
+) -> Option<(TantivyDocument, EntityRec)> {
     let mut d = TantivyDocument::default();
     let id_str = format_uuid(id);
     d.add_text(f.id, &id_str);
@@ -781,6 +772,12 @@ fn build_entity(
     let snip = snippet_of(if body.trim().is_empty() { &comment_text } else { &body }, 180);
     d.add_text(f.snippet, &snip);
     rec.snippet = snip;
+    if !body.is_empty() {
+        d.add_text(f.full_body, &body);
+    }
+    if !comment_text.is_empty() {
+        d.add_text(f.full_comments, &comment_text);
+    }
 
     let inb = side.inbound.get(&id).copied().unwrap_or(0);
     d.add_u64(f.inbound, inb as u64);
@@ -793,7 +790,7 @@ fn build_entity(
     }
     d.add_u64(f.rank_flags, rank_flags);
 
-    Some((d, rec, body, comment_text))
+    Some((d, rec))
 }
 
 #[cfg(test)]

@@ -121,11 +121,14 @@ enum Cmd {
     /// List curated search pins (from `<index>/pins.json`).
     Pins,
 
-    /// Time the queries from the search-issues note.
+    /// Time every query from the search-issues note.
     Bench {
         /// Iterations per query.
         #[arg(long, default_value_t = 5)]
         iters: usize,
+        /// `text` for a terminal table, `md` for a Markdown table.
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 
     /// Interactive incremental search — the "updates as I type" demo.
@@ -269,7 +272,7 @@ fn real_main() -> Result<()> {
             Ok(())
         }
 
-        Cmd::Bench { iters } => bench(&cli.index, *iters),
+        Cmd::Bench { iters, format } => bench(&cli.index, *iters, format),
         Cmd::Repl => repl(&cli.index),
 
         Cmd::Dbs { needle } => {
@@ -636,7 +639,7 @@ fn find(
     let rec = eng
         .entity(id)?
         .with_context(|| format!("no entity {}", format_uuid(id)))?;
-    let (body, comments) = eng.store.get_texts(id)?.unwrap_or_default();
+    let (body, comments) = eng.full_text(id)?.unwrap_or_default();
 
     println!();
     println!(
@@ -771,48 +774,105 @@ const PINS_EXAMPLE: &str = r#"
 
 // ----------------------------------------------------------------- bench
 
-/// Times the queries the note actually complains about, plus the ones it asks
-/// for but Fibery cannot express.
-fn bench(index: &std::path::Path, iters: usize) -> Result<()> {
+/// One row of the benchmark: a complaint from the note, and the query that
+/// answers it.
+struct Case<'a> {
+    /// Who raised it, for grouping.
+    section: &'a str,
+    /// The complaint, in the reporter's terms.
+    complaint: &'a str,
+    query: &'a str,
+    /// What to look for in the result, when a count alone is not the point.
+    expect: &'a str,
+}
+
+/// Every documented issue and request from the search-issues note, with the
+/// query that answers it. This is the single source of truth for the results
+/// table in the README — `--format md` regenerates it.
+fn cases() -> Vec<Case<'static>> {
+    vec![
+        Case { section: "Reported bug", complaint: "`Created by: Sami Kyostila` with empty text string -> only 2 docs",
+               query: "by:@sami", expect: "hundreds, not 2" },
+        Case { section: "Reported bug", complaint: "...most recent first",
+               query: "by:@sami sort:recent", expect: "same set, ordered" },
+        Case { section: "Reported bug", complaint: "...narrowed to one database",
+               query: "by:@sami #note", expect: "structure composes" },
+
+        Case { section: "Search is slow", complaint: "plain single-word search",
+               query: "interventions", expect: "" },
+        Case { section: "Search is slow", complaint: "multi-word search",
+               query: "load flow analysis", expect: "" },
+        Case { section: "Search is slow", complaint: "quoted phrase (large result set)",
+               query: "\"point cloud\"", expect: "worst realistic query" },
+        Case { section: "Search is slow", complaint: "match everything (worst case)",
+               query: "", expect: "" },
+
+        Case { section: "Fuzzy / tenses", complaint: "`subdivide` should find \"...Geometry subdivision in wasm\"",
+               query: "subdivide #scope", expect: "the exact scope is present" },
+        Case { section: "Fuzzy / tenses", complaint: "...without the fuzzy tier, for comparison",
+               query: "subdivide #scope fuzzy:off", expect: "fewer: fuzzy is doing work" },
+        Case { section: "Fuzzy / tenses", complaint: "tenses and plurals collapse",
+               query: "intervention", expect: "same as `interventions`" },
+        Case { section: "Fuzzy / tenses", complaint: "Toby: `DataView` should find the \"Data Views\" guide",
+               query: "DataView", expect: "top hit is \"Data Views\"" },
+
+        Case { section: "Filter by database", complaint: "Michael: bare `RVO` is useless, it is everywhere",
+               query: "rvo", expect: "spread over 54 databases" },
+        Case { section: "Filter by database", complaint: "Michael: what he wants to type is `RVO #Bet`",
+               query: "rvo #bet", expect: "just the Bets" },
+        Case { section: "Filter by database", complaint: "\"it will update the filtering as I type\"",
+               query: "interv*", expect: "prefix, per keystroke" },
+        Case { section: "Filter by database", complaint: "sidebar filter misses obvious items",
+               query: "title:experience*", expect: "prefix on titles works" },
+
+        Case { section: "Related things", complaint: "Michael: all Notes related to the Platform team containing \"Interventions\"",
+               query: "#note related:(#team platform) interventions", expect: "" },
+        Case { section: "Related things", complaint: "...through a *named* relation, type-constrained",
+               query: "#note team:(platform)", expect: "" },
+
+        Case { section: "Teammate activity", complaint: "Michael: what has my teammate worked on or commented on recently",
+               query: "touched-by:@michael updated:-30d sort:recent", expect: "cross-database, one query" },
+        Case { section: "Teammate activity", complaint: "...only what they commented on",
+               query: "commented-by:@michael updated:-90d", expect: "" },
+
+        Case { section: "Ranking", complaint: "search for \"claude\" should put the useful page first",
+               query: "claude", expect: "guides and workshop notes on top" },
+        Case { section: "Ranking", complaint: "...and deprioritise guides marked \"not started\"",
+               query: "#guide claude", expect: "Live before Draft before Not started" },
+
+        Case { section: "Lloyd: disposable query builder", complaint: "\"use Search as a quick disposable query builder\"",
+               query: "#issue is:open has:assignee created:2026-01..2026-06 -title:rollbar sort:recent",
+               expect: "a whole view, typed inline" },
+        Case { section: "Lloyd: disposable query builder", complaint: "boolean composition",
+               query: "crash OR failure -#issue", expect: "" },
+        Case { section: "Lloyd: disposable query builder", complaint: "workflow state from the schema flag",
+               query: "#issue is:open", expect: "" },
+    ]
+}
+
+/// Times every case. `format=md` emits the README table.
+fn bench(index: &std::path::Path, iters: usize, format: &str) -> Result<()> {
     let eng = Engine::open(index)?;
-
-    let cases: Vec<(&str, &str)> = vec![
-        ("issue: field filter with empty text", "by:@sami"),
-        ("  same, most recent first", "by:@sami sort:recent"),
-        ("  same, narrowed to one database", "by:@sami #note"),
-        ("issue: plain text search", "interventions"),
-        ("issue: two-word text search", "load flow analysis"),
-        ("issue: quoted phrase", "\"point cloud\""),
-        ("ask: #database filter (RVO #Bet)", "rvo #bet"),
-        ("  prefix-as-you-type", "interv*"),
-        ("ask: notes related to a team, containing a word",
-         "#note related:(#team platform) interventions"),
-        ("ask: teammate activity, cross-database",
-         "touched-by:@michael updated:-30d sort:recent"),
-        ("  narrowed to comments only", "commented-by:@michael updated:-90d"),
-        ("expressive: boolean + negation", "crash OR failure -#issue"),
-        ("expressive: date window", "#issue created:2026-01..2026-06"),
-        ("expressive: state + assignee", "#issue is:open has:assignee"),
-        ("expressive: title-scoped", "title:keycloak"),
-        ("worst case: match everything", ""),
-    ];
-
-    println!();
-    println!(
-        "{:<50} {:>9} {:>9} {:>9}",
-        "query", "matches", "count", "full"
-    );
-    println!("{}", "─".repeat(80));
+    let md = format.eq_ignore_ascii_case("md");
+    let all = cases();
 
     let median = |mut v: Vec<f64>| -> f64 {
         v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN timings"));
         v[v.len() / 2]
     };
 
-    for (label, q) in cases {
-        let (spec, _) = Parser::parse(q);
-        // Two measurements: matching alone, and the whole user-visible path
-        // (match + rank + fetch + decode the top 20 stored documents).
+    if md {
+        println!("| Complaint | vibery query | Matches | Latency |");
+        println!("|---|---|---:|---:|");
+    } else {
+        println!();
+        println!("{:<58} {:>9} {:>9} {:>9}", "query", "matches", "count", "full");
+        println!("{}", "─".repeat(88));
+    }
+
+    let mut section = "";
+    for c in &all {
+        let (spec, _) = Parser::parse(c.query);
         let full_spec = Spec { limit: 20, ..spec.clone() };
         let mut count_ms = Vec::with_capacity(iters);
         let mut full_ms = Vec::with_capacity(iters);
@@ -825,22 +885,65 @@ fn bench(index: &std::path::Path, iters: usize) -> Result<()> {
             let _ = eng.search(&full_spec, Vec::new())?;
             full_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         }
-        println!(
-            "{:<50} {:>9} {:>7.2}ms {:>7.2}ms",
-            truncate(label, 50),
-            total,
-            median(count_ms),
-            median(full_ms)
-        );
-        if !q.is_empty() {
-            println!("  \x1b[2m{q}\x1b[0m");
+        let (cm, fm) = (median(count_ms), median(full_ms));
+
+        if c.section != section {
+            section = c.section;
+            if md {
+                println!("| **{section}** | | | |");
+            } else {
+                println!();
+                println!("\x1b[1;35m{section}\x1b[0m");
+            }
+        }
+        if md {
+            let q = if c.query.is_empty() {
+                "*(empty)*".to_string()
+            } else {
+                format!("`{}`", c.query.replace('|', "\\|"))
+            };
+            println!(
+                "| {} | {} | {} | {:.2} ms |",
+                c.complaint.replace('|', "\\|"),
+                q,
+                total,
+                fm
+            );
+        } else {
+            println!(
+                "  {:<56} {:>9} {:>7.2}ms {:>7.2}ms",
+                truncate(c.complaint, 56),
+                total,
+                cm,
+                fm
+            );
+            println!(
+                "    \x1b[2m{}{}\x1b[0m",
+                if c.query.is_empty() { "(empty query)" } else { c.query },
+                if c.expect.is_empty() {
+                    String::new()
+                } else {
+                    format!("   -> {}", c.expect)
+                }
+            );
         }
     }
-    println!();
-    println!("\x1b[2mcount = matching only.  full = match + rank + fetch top 20 stored docs,");
-    println!("i.e. everything behind one keystroke. Median of {iters} runs, single");
-    println!("thread, warm page cache.\x1b[0m");
-    println!();
+
+    if md {
+        println!();
+        println!(
+            "Latency is the full user-visible path — match, rank, fetch and decode the top 20 \
+             stored documents — median of {iters} runs, single thread, warm cache, over {} \
+             indexed entities.",
+            eng.meta.entities_indexed
+        );
+    } else {
+        println!();
+        println!("\x1b[2mcount = matching only.  full = match + rank + fetch top 20 stored docs,");
+        println!("i.e. everything behind one keystroke. Median of {iters} runs, single");
+        println!("thread, warm page cache, {} entities.\x1b[0m", eng.meta.entities_indexed);
+        println!();
+    }
     Ok(())
 }
 
@@ -894,9 +997,15 @@ TEXT
   interventions              a word, anywhere (title, prose, or comments)
   \"load flow\"                a phrase, in order
   interv*                    prefix — what incremental search-as-you-type uses
+  subdivide~                 explicitly fuzzy (~2 allows two edits)
   title:keycloak             restrict to the title
   body:scim                  restrict to prose
   comments:regression        restrict to comment threads
+
+  Words are stemmed, so `intervention` and `interventions` are one term, and
+  camelCase is split, so `DataView` finds a doc titled \"Data Views\". Long words
+  also get a distance-1 fuzzy pass, which is how `subdivide` reaches
+  \"...Geometry subdivision in wasm\". Turn it off with `fuzzy:off` or --strict.
 
 DATABASE  (the `RVO #Bet` request — no mouse required)
   #bet                       resolved fuzzily: #bet, #Bet, #Engineering/Bet
@@ -944,4 +1053,12 @@ COMBINING
 OUTPUT
   sort:recent | created | oldest | relevance
   limit:50
+  fuzzy:off / strict:on      exact stems only, no fuzzy pass
+
+RANKING (sort:relevance)
+  BM25 with a title boost over prose over comments, multiplied by: how often
+  the entity is referenced, how substantial its prose is, a bounded recency
+  nudge (capped, so an old authoritative page is not buried), and a penalty
+  for anything whose workflow state is \"Not started\".
+  An optional pins.json promotes a chosen entity for chosen terms.
 ";

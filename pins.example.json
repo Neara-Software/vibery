@@ -1,0 +1,12 @@
+[
+  {
+    "terms": ["claude", "claude code"],
+    "id": "9606c506-c8dd-4ef1-83da-238a7997072a",
+    "why": "canonical setup guide — the answer people actually want"
+  },
+  {
+    "terms": ["dataview", "data views", "data view"],
+    "id": "49ef5086-a49f-4750-85fa-7a9468bb4853",
+    "why": "the reference doc, not the design discussion"
+  }
+]

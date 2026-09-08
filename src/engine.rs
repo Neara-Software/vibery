@@ -726,6 +726,25 @@ impl Engine {
         })
     }
 
+    /// The full folded prose and comment text for one entity, for in-entity
+    /// search. Read from Tantivy's compressed stored fields.
+    pub fn full_text(&self, id: u128) -> Result<Option<(String, String)>> {
+        let searcher = self.reader.searcher();
+        let q = TermQuery::new(
+            Term::from_field_text(self.fields.id, &format_uuid(id)),
+            IndexRecordOption::Basic,
+        );
+        let top = searcher.search(&q, &TopDocs::with_limit(1))?;
+        let Some((_, addr)) = top.first() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(*addr)?;
+        let get = |f: tantivy::schema::Field| -> String {
+            doc.get_first(f).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        };
+        Ok(Some((get(self.fields.full_body), get(self.fields.full_comments))))
+    }
+
     /// Fetch a single hit by entity id, for pin promotion.
     fn hit_by_id(&self, id: u128) -> Result<Option<Hit>> {
         let (spec, _) = crate::query::Parser::parse(&format!("id:{}", format_uuid(id)));

@@ -52,6 +52,12 @@ pub struct Fields {
     pub text_len: Field,
     /// Ranking bitset; see [`flags`].
     pub rank_flags: Field,
+    /// Full folded prose, stored but NOT indexed — `body` already covers
+    /// search. This exists so `vibery find` can Ctrl-F inside one entity.
+    /// Stored here rather than in redb because Tantivy zstd-compresses stored
+    /// field blocks, which is several times smaller for this much text.
+    pub full_body: Field,
+    pub full_comments: Field,
 }
 
 /// Bits in the `rank_flags` fast field. Kept as one packed u64 so the scoring
@@ -106,6 +112,8 @@ pub fn build_schema() -> (Schema, Fields) {
     let updated_at = sb.add_date_field("updated_at", date_opts);
 
     let snippet = sb.add_text_field("snippet", STORED);
+    let full_body = sb.add_text_field("full_body", STORED);
+    let full_comments = sb.add_text_field("full_comments", STORED);
     let state = sb.add_text_field("state", STRING | STORED);
     let numeric = NumericOptions::default().set_stored().set_fast();
     let inbound = sb.add_u64_field("inbound", numeric.clone());
@@ -133,6 +141,8 @@ pub fn build_schema() -> (Schema, Fields) {
         inbound,
         text_len,
         rank_flags,
+        full_body,
+        full_comments,
     };
     (schema, fields)
 }
@@ -165,6 +175,8 @@ impl Fields {
             inbound: g("inbound")?,
             text_len: g("text_len")?,
             rank_flags: g("rank_flags")?,
+            full_body: g("full_body")?,
+            full_comments: g("full_comments")?,
         })
     }
 }
