@@ -3,6 +3,8 @@ name = "vibery"
 version = "0.1.0"
 edition = "2021"
 description = "A fast, expressive search backend for Fibery-shaped knowledge graphs"
+publish = false
+license-file = "LICENSE"
 
 [dependencies]
 tantivy = "0.22"

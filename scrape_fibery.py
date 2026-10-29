@@ -29,8 +29,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+DOC_DB = "Collaboration~Documents/Document"
+# Deltas re-read this far behind the last sync: covers clock skew and
+# writes that were in flight while the previous run was paging.
+WATERMARK_MARGIN = timedelta(minutes=10)
 
 
 class RateLimiter:
@@ -149,15 +154,13 @@ class FiberyClient:
             try:
                 responses = self.execute_commands(batch)
                 for name, r in zip(chunk, responses):
+                    # Failed counts are left out rather than reported as 0, so
+                    # --update can't mistake an API error for "everything deleted".
                     if r.get("success"):
                         cnt = r.get("result", 0)
                         results[name] = int(cnt) if isinstance(cnt, (int, float)) else 0
-                    else:
-                        results[name] = 0
             except Exception as e:
                 print(f"  [WARN] Failed to batch count chunk {i}-{i+len(chunk)}: {e}", file=sys.stderr)
-                for name in chunk:
-                    results[name] = 0
         return results
 
     def query_page(
@@ -165,9 +168,15 @@ class FiberyClient:
         db_name: str,
         select_fields: List[Any],
         page_size: int,
-        last_seen_id: Optional[str] = None
+        last_seen_id: Optional[str] = None,
+        since_field: Optional[str] = None,
+        since: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Query a page of entities using cursor pagination."""
+        """Query a page of entities using cursor pagination.
+
+        With since_field/since set, returns rows with since_field >= since, keyset-paged
+        on (since_field, fibery/id): `since` and `last_seen_id` are the last row's pair.
+        Ordering a filtered 2M-row table by id alone times out server-side."""
         query: Dict[str, Any] = {
             "q/from": db_name,
             "q/select": select_fields,
@@ -176,7 +185,13 @@ class FiberyClient:
         }
 
         params: Dict[str, Any] = {}
-        if last_seen_id is not None:
+        if since is not None:
+            query["q/order-by"] = [[[since_field], "q/asc"], [["fibery/id"], "q/asc"]]
+            query["q/where"] = ["q/or", [">", [since_field], "$since"],
+                                ["q/and", ["=", [since_field], "$since"], [">", ["fibery/id"], "$last-seen-id"]]]
+            params["$since"] = since
+            params["$last-seen-id"] = last_seen_id or "00000000-0000-0000-0000-000000000000"
+        elif last_seen_id is not None:
             query["q/where"] = [">", ["fibery/id"], "$last-seen-id"]
             params["$last-seen-id"] = last_seen_id
 
@@ -341,13 +356,15 @@ class ProgressTracker:
     def is_completed(self, db_name: str) -> bool:
         return db_name in self.data.get("completed_databases", {})
 
-    def mark_completed(self, db_name: str, count: int, file_path: str):
+    def mark_completed(self, db_name: str, count: int, file_path: str, synced_at: datetime):
+        """synced_at: a time before the data was read; the next --update fetches changes since then."""
         if "completed_databases" not in self.data:
             self.data["completed_databases"] = {}
         self.data["completed_databases"][db_name] = {
             "entity_count": count,
             "file": file_path,
             "completed_at": datetime.now(timezone.utc).isoformat(),
+            "synced_at": synced_at.isoformat(),
         }
         self.data["total_entities_scraped"] = sum(
             item.get("entity_count", 0) for item in self.data["completed_databases"].values()
@@ -385,6 +402,122 @@ def load_auth_config(config_path: str) -> Tuple[str, str]:
     return workspace, api_key
 
 
+def effective_page_size_for(page_size: int, select_fields: List[Any]) -> int:
+    size = min(page_size, 2500)
+    return min(size, 1000) if len(select_fields) > 50 else size
+
+
+def delta_field(analyzer: "SchemaAnalyzer", db_name: str) -> Optional[str]:
+    """The date field that --update filters on. Types with only a creation date
+    (comments, references, files) are treated as append-only."""
+    names = {f["fibery/name"] for f in analyzer.types_by_name[db_name].get("fibery/fields", [])}
+    for f in ("fibery/modification-date", "Collaboration~Documents/modification-date", "fibery/creation-date"):
+        if f in names:
+            return f
+    return None
+
+
+def fetch_all(
+    client: FiberyClient,
+    db_name: str,
+    select_fields: List[Any],
+    page_size: int,
+    since_field: Optional[str] = None,
+    since: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Page through every matching entity into memory. Meant for deltas and id sweeps, not full scrapes."""
+    size = effective_page_size_for(page_size, select_fields)
+    out: List[Dict[str, Any]] = []
+    last_seen_id: Optional[str] = None
+    while True:
+        page = client.query_page(db_name, select_fields, size, last_seen_id, since_field, since)
+        out.extend(page[:size])
+        if len(page) <= size:
+            return out
+        last_seen_id = page[size - 1]["fibery/id"]
+        if since_field is not None:
+            since = page[size - 1][since_field]
+
+
+def upsert_jsonl(path: str, key: str, updates: Dict[str, Any], live_keys: Optional[Set[str]] = None) -> int:
+    """Rewrite a JSONL file with `updates` (key -> record) merged in, dropping rows
+    whose key is not in `live_keys` when given. Returns the resulting row count."""
+    if not updates and live_keys is None and os.path.exists(path):
+        with open(path, "rb") as f:
+            return sum(1 for line in f if line.strip())
+    pending = dict(updates)
+    n = 0
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as out:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    k = json.loads(line).get(key)
+                    if live_keys is not None and k not in live_keys:
+                        continue
+                    rec = pending.pop(k, None)
+                    out.write(line if rec is None else json.dumps(rec, ensure_ascii=False) + "\n")
+                    n += 1
+        for rec in pending.values():
+            out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            n += 1
+    os.replace(tmp, path)
+    return n
+
+
+def refresh_documents(client: FiberyClient, secrets: List[str], target_dir: str, batch_size: int = 200) -> int:
+    """Re-fetch rich-text bodies and merge them into documents.jsonl and documents/*.md."""
+    fetched: Dict[str, Any] = {}
+    for i in range(0, len(secrets), batch_size):
+        for doc in client.batch_get_documents(secrets[i:i + batch_size], format="md"):
+            if doc.get("secret"):
+                fetched[doc["secret"]] = doc
+    documents_dir = os.path.join(target_dir, "documents")
+    os.makedirs(documents_dir, exist_ok=True)
+    for sec, doc in fetched.items():
+        with open(os.path.join(documents_dir, f"{sec}.md"), "w", encoding="utf-8") as f:
+            f.write(doc.get("content", ""))
+    upsert_jsonl(os.path.join(target_dir, "documents.jsonl"), "secret", fetched)
+    return len(fetched)
+
+
+def update_database(
+    client: FiberyClient,
+    db_name: str,
+    select_fields: List[Any],
+    output_path: str,
+    since_field: str,
+    since: str,
+    server_count: Optional[int],
+    page_size: int,
+    target_dir: str,
+) -> int:
+    """Merge entities changed since `since` into an existing JSONL file; returns the new row count."""
+    changed = fetch_all(client, db_name, select_fields, page_size, since_field, since)
+    n = upsert_jsonl(output_path, "fibery/id", {r["fibery/id"]: r for r in changed})
+
+    # A date filter never returns deleted entities. Every create/edit is already
+    # merged, so local > server means something was deleted: sweep ids to find it.
+    # chisle: Document rows are skipped. They orphan harmlessly when their owner
+    # goes, and sweeping 2M+ ids takes ~15 min at 1 req/s.
+    deleted = 0
+    if server_count is not None and n > server_count and db_name != DOC_DB:
+        live = {r["fibery/id"] for r in fetch_all(client, db_name, ["fibery/id"], 2500)}
+        before = n
+        n = upsert_jsonl(output_path, "fibery/id", {}, live)
+        deleted = before - n
+
+    docs = 0
+    if db_name == DOC_DB and os.path.exists(os.path.join(target_dir, "documents.jsonl")):
+        secrets = sorted({r["Collaboration~Documents/secret"] for r in changed if r.get("Collaboration~Documents/secret")})
+        docs = refresh_documents(client, secrets, target_dir)
+
+    print(f"    ✓ {len(changed):,} changed, {deleted:,} deleted, {docs:,} bodies refreshed -> {n:,} total")
+    return n
+
+
 def scrape_database(
     client: FiberyClient,
     db_name: str,
@@ -401,9 +534,7 @@ def scrape_database(
     last_seen_id: Optional[str] = None
     t0 = time.time()
 
-    effective_page_size = min(page_size, 2500)
-    if len(select_fields) > 50:
-        effective_page_size = min(effective_page_size, 1000)
+    effective_page_size = effective_page_size_for(page_size, select_fields)
     if limit is not None:
         effective_page_size = min(effective_page_size, limit)
 
@@ -539,6 +670,12 @@ def main():
         help="Force re-scraping of already completed databases",
     )
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="Incremental: fetch only entities changed since the last sync, drop deleted ones, "
+             "refresh changed rich-text bodies in documents.jsonl. New or re-shaped databases get a full scrape.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Inspect schema and print entity counts without downloading data",
@@ -629,11 +766,26 @@ def main():
     progress = ProgressTracker(progress_file)
     progress.data["counts"] = db_counts
 
+    # Field lists from the previous run: a database whose fields changed needs a
+    # full re-scrape, since a delta would leave old rows missing the new fields.
+    previous_fields: Dict[str, List[str]] = {}
+    previous_manifest: Dict[str, Any] = {}
+    manifest_file = os.path.join(target_dir, "manifest.json")
+    if os.path.exists(manifest_file):
+        with open(manifest_file, "r", encoding="utf-8") as f:
+            previous_manifest = json.load(f).get("databases", {})
+        for name, entry in previous_manifest.items():
+            previous_fields[name] = [fm["name"] for fm in entry.get("fields", [])]
+
     sorted_dbs = sorted(target_dbs, key=lambda name: db_counts.get(name, 0))
 
     print(f"\n[Step 3/4] Scraping entity records to JSONL files...")
     all_rich_text_secrets: Set[str] = set()
-    manifest_entries: Dict[str, Any] = {}
+    # Keep entries for databases outside a --databases subset: ingest reads the
+    # manifest to find every file.
+    manifest_entries: Dict[str, Any] = {
+        name: entry for name, entry in previous_manifest.items() if name in all_queryable_dbs
+    }
 
     start_time = time.time()
     total_dbs = len(sorted_dbs)
@@ -653,17 +805,42 @@ def main():
             "fields": field_metas,
         }
 
-        if not args.force and progress.is_completed(db_name):
-            completed_info = progress.data["completed_databases"][db_name]
+        synced_at = datetime.now(timezone.utc)
+        completed_info = progress.data.get("completed_databases", {}).get(db_name)
+        since_field = delta_field(analyzer, db_name)
+        fields_now = [fm["name"] for fm in field_metas]
+        if (
+            args.update and not args.force and completed_info is not None and since_field is not None
+            and os.path.exists(abs_file_path) and previous_fields.get(db_name) == fields_now
+        ):
+            # Scrapes from before --update existed have no synced_at; the run's
+            # start time predates every one of their reads.
+            last = datetime.fromisoformat(completed_info.get("synced_at") or progress.data["started_at"])
+            since = (last - WATERMARK_MARGIN).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+            print(f"  [{idx}/{total_dbs}] Updating '{db_name}' ({since_field} >= {since})...")
+            try:
+                n = update_database(
+                    client, db_name, select_fields, abs_file_path, since_field, since,
+                    db_counts.get(db_name), args.page_size, target_dir,
+                )
+            except Exception as e:
+                print(f"    ✗ ERROR updating '{db_name}': {e}", file=sys.stderr)
+                manifest_entries[db_name]["scraped_count"] = completed_info.get("entity_count", count)
+                continue
+            progress.mark_completed(db_name, n, rel_file_path, synced_at)
+            manifest_entries[db_name]["scraped_count"] = n
+            continue
+
+        if not args.force and not args.update and completed_info is not None:
             manifest_entries[db_name]["scraped_count"] = completed_info.get("entity_count", count)
             if args.verbose:
                 print(f"  [{idx}/{total_dbs}] SKIPPING {db_name} (already completed: {completed_info.get('entity_count')} entities)")
             continue
 
-        if count == 0:
+        if count == 0 and db_name in db_counts:
             with open(abs_file_path, "w", encoding="utf-8") as f:
                 pass
-            progress.mark_completed(db_name, 0, rel_file_path)
+            progress.mark_completed(db_name, 0, rel_file_path, synced_at)
             manifest_entries[db_name]["scraped_count"] = 0
             continue
 
@@ -681,7 +858,7 @@ def main():
                 verbose=args.verbose,
             )
 
-            progress.mark_completed(db_name, fetched_count, rel_file_path)
+            progress.mark_completed(db_name, fetched_count, rel_file_path, synced_at)
             manifest_entries[db_name]["scraped_count"] = fetched_count
             print(f"    ✓ Saved {fetched_count:,} entities -> {rel_file_path}")
 
@@ -697,12 +874,11 @@ def main():
         "total_entities_scraped": progress.data.get("total_entities_scraped", 0),
         "databases": manifest_entries,
     }
-    manifest_file = os.path.join(target_dir, "manifest.json")
     with open(manifest_file, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     print(f"  ✓ Manifest saved to: {manifest_file}")
 
-    if args.fetch_documents:
+    if args.fetch_documents and not args.update:
         print("\n[Optional] Extracting rich-text document secrets from scraped JSONL files...")
         doc_fields_by_db = {}
         for db_name, entry in manifest_entries.items():

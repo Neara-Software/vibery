@@ -330,8 +330,9 @@ polish:
   version needs ACL terms indexed per document and intersected at query time —
   and that constraint may change the ranking design, since a filter that
   removes most candidates wants to run first.
-- **No incremental updates.** Ingest is a full rebuild. It's only 12 seconds,
-  so this is fine for a spike, but real use wants Fibery's webhooks driving
+- **No incremental ingest.** `scrape_fibery.py --update` pulls only deltas
+  from Fibery, but ingest is still a full rebuild. It's only 12 seconds, so
+  this is fine for a spike, but real use wants Fibery's webhooks driving
   single-document upserts.
 - **No semantic search.** 16 types have `semantic-index/enabled`. Everything
   here is lexical; "find the doc about authentication uplift" won't match
