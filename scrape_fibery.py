@@ -142,15 +142,23 @@ class FiberyClient:
         res = self.execute_single_command("fibery.entity/query", {"query": q})
         return int(res) if isinstance(res, (int, float)) else 0
 
-    def batch_count_entities(self, db_names: List[str], batch_size: int = 50) -> Dict[str, int]:
-        """Count entities for multiple databases in batched requests."""
+    def batch_count_entities(
+        self, db_names: List[str], batch_size: int = 50, since: Optional[Dict[str, Tuple[str, str]]] = None,
+    ) -> Dict[str, int]:
+        """Count entities for multiple databases in batched requests. With `since`
+        (db -> (date field, iso time)), count only rows with field >= time."""
+        def count_cmd(name: str) -> Dict[str, Any]:
+            args: Dict[str, Any] = {"query": {"q/from": name, "q/select": ["q/count", ["fibery/id"]]}}
+            if since is not None:
+                field, at = since[name]
+                args["query"]["q/where"] = [">=", [field], "$since"]
+                args["params"] = {"$since": at}
+            return {"command": "fibery.entity/query", "args": args}
+
         results = {}
         for i in range(0, len(db_names), batch_size):
             chunk = db_names[i:i + batch_size]
-            batch = [
-                {"command": "fibery.entity/query", "args": {"query": {"q/from": name, "q/select": ["q/count", ["fibery/id"]]}}}
-                for name in chunk
-            ]
+            batch = [count_cmd(name) for name in chunk]
             try:
                 responses = self.execute_commands(batch)
                 for name, r in zip(chunk, responses):
@@ -787,6 +795,37 @@ def main():
         name: entry for name, entry in previous_manifest.items() if name in all_queryable_dbs
     }
 
+    # Databases --update can delta-sync, mapped to (date field, since).
+    delta_since: Dict[str, Tuple[str, str]] = {}
+    if args.update and not args.force:
+        for db_name in sorted_dbs:
+            completed_info = progress.data.get("completed_databases", {}).get(db_name)
+            since_field = delta_field(analyzer, db_name)
+            fields_now = [fm["name"] for fm in analyzer.build_select_clause(db_name)[1]]
+            abs_file_path = os.path.join(databases_dir, f"{sanitize_filename(db_name)}.jsonl")
+            if (
+                completed_info is not None and since_field is not None
+                and os.path.exists(abs_file_path) and previous_fields.get(db_name) == fields_now
+            ):
+                # Scrapes from before --update existed have no synced_at; the run's
+                # start time predates every one of their reads.
+                last = datetime.fromisoformat(completed_info.get("synced_at") or progress.data["started_at"])
+                since = (last - WATERMARK_MARGIN).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                delta_since[db_name] = (since_field, since)
+
+    # One batched count per 50 databases finds those with no changes and no
+    # deletions, so they skip their own delta query.
+    unchanged: Set[str] = set()
+    precheck_at = datetime.now(timezone.utc)
+    if delta_since:
+        changed_counts = client.batch_count_entities(list(delta_since), since=delta_since)
+        completed = progress.data["completed_databases"]
+        unchanged = {
+            name for name, n in changed_counts.items()
+            if n == 0 and db_counts.get(name) == completed[name].get("entity_count")
+        }
+        print(f"  ✓ {len(unchanged)} / {len(delta_since)} databases unchanged since last sync")
+
     start_time = time.time()
     total_dbs = len(sorted_dbs)
 
@@ -807,16 +846,12 @@ def main():
 
         synced_at = datetime.now(timezone.utc)
         completed_info = progress.data.get("completed_databases", {}).get(db_name)
-        since_field = delta_field(analyzer, db_name)
-        fields_now = [fm["name"] for fm in field_metas]
-        if (
-            args.update and not args.force and completed_info is not None and since_field is not None
-            and os.path.exists(abs_file_path) and previous_fields.get(db_name) == fields_now
-        ):
-            # Scrapes from before --update existed have no synced_at; the run's
-            # start time predates every one of their reads.
-            last = datetime.fromisoformat(completed_info.get("synced_at") or progress.data["started_at"])
-            since = (last - WATERMARK_MARGIN).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        if db_name in unchanged:
+            progress.mark_completed(db_name, completed_info["entity_count"], rel_file_path, precheck_at)
+            manifest_entries[db_name]["scraped_count"] = completed_info["entity_count"]
+            continue
+        if db_name in delta_since:
+            since_field, since = delta_since[db_name]
             print(f"  [{idx}/{total_dbs}] Updating '{db_name}' ({since_field} >= {since})...")
             try:
                 n = update_database(
