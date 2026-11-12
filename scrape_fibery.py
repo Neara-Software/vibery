@@ -24,6 +24,8 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -633,6 +635,27 @@ def fetch_all_documents(
     print(f"\n[INFO] Finished downloading {fetched:,} documents to {documents_dir}")
 
 
+def rebuild_index(data_dir: str, index_dir: str):
+    """Build the vibery index beside `index_dir`, then swap it in, so searches
+    running during the rebuild keep reading the old one."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    new_dir, old_dir = f"{index_dir}.new", f"{index_dir}.old"
+    for d in (new_dir, old_dir):
+        shutil.rmtree(d, ignore_errors=True)
+    print(f"\nRebuilding search index -> {index_dir}")
+    subprocess.run(
+        ["cargo", "run", "--release", "--quiet", "--manifest-path", os.path.join(repo, "Cargo.toml"), "--",
+         "--data", data_dir, "--index", new_dir, "ingest"],
+        check=True,
+    )
+    if os.path.exists(os.path.join(index_dir, "pins.json")):
+        shutil.copy(os.path.join(index_dir, "pins.json"), new_dir)
+    if os.path.exists(index_dir):
+        os.rename(index_dir, old_dir)
+    os.rename(new_dir, index_dir)
+    shutil.rmtree(old_dir, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Scrape all data from Fibery REST API with rate limiting and checkpointing for Rust reimplementation."
@@ -697,6 +720,14 @@ def main():
         "--fetch-documents",
         action="store_true",
         help="Also fetch full Markdown contents for all rich-text documents",
+    )
+    parser.add_argument(
+        "--ingest",
+        nargs="?",
+        const=os.path.join(os.path.dirname(os.path.abspath(__file__)), "index"),
+        metavar="INDEX_DIR",
+        help="After the scrape, rebuild the vibery search index (default: index/ next to this script). "
+             "Needs cargo.",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -960,6 +991,9 @@ def main():
     print(f"Schema File            : {schema_file}")
     print(f"Manifest File          : {manifest_file}")
     print("=" * 70)
+
+    if args.ingest:
+        rebuild_index(target_dir, os.path.abspath(os.path.expanduser(args.ingest)))
 
 
 if __name__ == "__main__":
