@@ -119,15 +119,20 @@ class FiberyClient:
             raise ValueError(f"Expected list response from /api/commands, got: {type(res)}")
         return res
 
-    def execute_single_command(self, command: str, args: Dict[str, Any]) -> Any:
+    def execute_single_command(self, command: str, args: Dict[str, Any], max_retries: int = 3) -> Any:
         """Execute a single command via /api/commands and return its result."""
-        res = self.execute_commands([{"command": command, "args": args}])
-        cmd_res = res[0]
-        if not cmd_res.get("success"):
+        for attempt in range(max_retries + 1):
+            cmd_res = self.execute_commands([{"command": command, "args": args}])[0]
+            if cmd_res.get("success"):
+                return cmd_res.get("result")
             err = cmd_res.get("result", {})
             err_msg = err.get("message") if isinstance(err, dict) else str(err)
-            raise RuntimeError(f"Command '{command}' failed: {err_msg}")
-        return cmd_res.get("result")
+            # Fibery reports its own query timeouts as a failed command, not an HTTP error.
+            if "internal timeout" not in err_msg or attempt == max_retries:
+                raise RuntimeError(f"Command '{command}' failed: {err_msg}")
+            backoff = 2 ** (attempt + 1)
+            print(f"  [WARN] Fibery internal timeout. Retrying in {backoff}s (retry {attempt + 1}/{max_retries})...", file=sys.stderr)
+            time.sleep(backoff)
 
     def get_schema(self, with_description: bool = True) -> Dict[str, Any]:
         """Fetch full Fibery schema."""
